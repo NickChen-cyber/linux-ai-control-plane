@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.7.0").strip() or "2.7.0"
+APP_VERSION = os.getenv("APP_VERSION", "2.7.1").strip() or "2.7.1"
 MIN_COMPATIBLE_SCHEMA = "019"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
@@ -3949,7 +3949,7 @@ def assign_alert_to_on_call(intent:dict[str,Any])->dict[str,Any]|None:
     with connect_db() as connection:
         event=connection.execute("SELECT id,assignee_id FROM alert_events WHERE id=%s",(intent["eventId"],)).fetchone()
         if not event or event["assignee_id"]: return None
-        shift=connection.execute("SELECT s.id,s.user_id,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND u.locked=FALSE AND s.starts_at<=NOW() AND s.ends_at>NOW() ORDER BY s.starts_at DESC LIMIT 1").fetchone()
+        shift=connection.execute("SELECT s.id,s.user_id,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND s.starts_at<=NOW() AND s.ends_at>NOW() ORDER BY s.starts_at DESC LIMIT 1").fetchone()
         if not shift: return None
         row=connection.execute("UPDATE alert_events SET assignee_id=%s,updated_at=NOW() WHERE id=%s AND assignee_id IS NULL RETURNING id",(shift["user_id"],event["id"])).fetchone()
         if not row: return None
@@ -4880,7 +4880,7 @@ async def update_alert_storm_policy(payload:AlertStormPolicyUpdate,request:Reque
 def read_on_call_schedule()->dict[str,Any]:
     with connect_db() as connection:
         shifts=connection.execute("SELECT s.*,u.username,u.display_name,s.starts_at<=NOW() AND s.ends_at>NOW() AND s.enabled AS active FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id ORDER BY CASE WHEN s.ends_at>NOW() THEN 0 ELSE 1 END,s.starts_at LIMIT 100").fetchall()
-        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE AND locked=FALSE ORDER BY display_name").fetchall()
+        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE ORDER BY display_name").fetchall()
         assignments=connection.execute("SELECT a.id,a.alert_event_id,a.assigned_at,u.display_name,h.name AS host_name,r.name AS rule_name FROM alert_assignments a JOIN platform_users u ON u.id=a.user_id JOIN alert_events e ON e.id=a.alert_event_id JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id ORDER BY a.assigned_at DESC LIMIT 50").fetchall()
     return {"users":[{"id":u["id"],"username":u["username"],"displayName":u["display_name"]} for u in users],"shifts":[{"id":s["id"],"userId":s["user_id"],"username":s["username"],"displayName":s["display_name"],"startsAt":s["starts_at"].isoformat(),"endsAt":s["ends_at"].isoformat(),"note":s["note"],"enabled":s["enabled"],"active":s["active"]} for s in shifts],"assignments":[{"id":a["id"],"alertEventId":a["alert_event_id"],"displayName":a["display_name"],"hostName":a["host_name"],"ruleName":a["rule_name"],"assignedAt":a["assigned_at"].isoformat()} for a in assignments]}
 
@@ -4892,7 +4892,7 @@ async def create_on_call_shift(payload:OnCallShiftCreate,request:Request)->dict[
     actor=require_permission(request,"alerts.manage")
     if payload.ends_at<=payload.starts_at: raise HTTPException(status_code=422,detail="值班結束時間必須晚於開始時間")
     with connect_db() as connection:
-        user=connection.execute("SELECT 1 FROM platform_users WHERE id=%s AND enabled=TRUE AND locked=FALSE",(payload.user_id,)).fetchone()
+        user=connection.execute("SELECT 1 FROM platform_users WHERE id=%s AND enabled=TRUE",(payload.user_id,)).fetchone()
         if not user: raise HTTPException(status_code=404,detail="值班使用者不存在或不可用")
         overlap=connection.execute("SELECT 1 FROM on_call_shifts WHERE enabled=TRUE AND starts_at<%s AND ends_at>%s",(payload.ends_at,payload.starts_at)).fetchone()
         if overlap: raise HTTPException(status_code=409,detail="此時段已有其他值班人員")

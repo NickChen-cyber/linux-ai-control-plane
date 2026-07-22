@@ -337,6 +337,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("assign_alert_to_on_call",source); self.assertIn("assignee_id IS NULL",source)
         self.assertIn("值班排程與自動指派",ui); self.assertIn("永久指派歷史",ui)
 
+    def test_on_call_uses_enabled_as_account_lock_state(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        section=source[source.index("def assign_alert_to_on_call"):source.index("async def dispatch_notifications")]+source[source.index("def read_on_call_schedule"):source.index("def read_notification_governance")]
+        self.assertIn("u.enabled=TRUE",section); self.assertNotIn("locked",section)
+        self.assertIn("伺服器錯誤（HTTP",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
