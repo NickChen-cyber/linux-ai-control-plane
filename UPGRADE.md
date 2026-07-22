@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.9.0-alert-ownership-sla.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v3.0.0-alert-sla-escalation.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -95,6 +95,10 @@ Schema 應為 `020`。到「告警中心 → 告警負責人工作佇列」，�
 ## 2.9.0 升級後驗證
 
 Schema 應為 `021`。到「告警中心 → 告警責任時效」，確認警告／重大期限、未指派逾時與即將逾期門檻可調整；作用中事件應依期限顯示追蹤中、即將逾期、已逾期或已確認。
+
+## 3.0.0 升級後驗證
+
+Schema 應為 `022`。建立或等待一筆超過責任 SLA 的未確認告警，最多 60 秒後「責任逾期升級紀錄」應新增一筆；確認或結案後應轉為 `recovered` 並保存恢復時間。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

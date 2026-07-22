@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.9.0").strip() or "2.9.0"
-MIN_COMPATIBLE_SCHEMA = "021"
+APP_VERSION = os.getenv("APP_VERSION", "3.0.0").strip() or "3.0.0"
+MIN_COMPATIBLE_SCHEMA = "022"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -2106,6 +2106,7 @@ async def lifespan(_: FastAPI):
     observability_task = asyncio.create_task(observability_loop(), name="service-observability-worker")
     report_task = asyncio.create_task(scheduled_report_loop(), name="scheduled-report-worker")
     escalation_task = asyncio.create_task(notification_escalation_loop(), name="notification-escalation-worker")
+    ownership_sla_task = asyncio.create_task(alert_ownership_sla_loop(), name="alert-ownership-sla-worker")
     rollup_task = asyncio.create_task(metric_rollup_loop(), name="metric-rollup-worker")
     try:
         yield
@@ -2122,6 +2123,7 @@ async def lifespan(_: FastAPI):
         observability_task.cancel()
         report_task.cancel()
         escalation_task.cancel()
+        ownership_sla_task.cancel()
         rollup_task.cancel()
         try:
             await asyncio.gather(
@@ -2134,6 +2136,7 @@ async def lifespan(_: FastAPI):
                 observability_task,
                 report_task,
                 escalation_task,
+                ownership_sla_task,
                 rollup_task,
             )
         except asyncio.CancelledError:
@@ -4947,6 +4950,7 @@ def read_alert_ownership_sla()->dict[str,Any]:
     with connect_db() as connection:
         policy=connection.execute("SELECT * FROM alert_ownership_policy WHERE id=1").fetchone()
         rows=connection.execute("""SELECT e.id,e.severity,e.started_at,e.acknowledged_at,e.assignee_id,u.display_name AS assignee_name,h.name AS host_name,r.name AS rule_name FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id LEFT JOIN platform_users u ON u.id=e.assignee_id WHERE e.status IN ('firing','acknowledged') ORDER BY e.started_at""").fetchall()
+        history=connection.execute("""SELECT s.*,h.name AS host_name,r.name AS rule_name FROM alert_sla_escalations s JOIN alert_events e ON e.id=s.alert_event_id JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id ORDER BY s.breached_at DESC LIMIT 100""").fetchall()
     events=[]
     for row in rows:
         limit=policy["critical_minutes"] if row["severity"]=="critical" else policy["warning_minutes"]
@@ -4957,7 +4961,7 @@ def read_alert_ownership_sla()->dict[str,Any]:
         elif remaining<=limit*60*policy["due_soon_percent"]/100: state="due_soon"
         else: state="tracking"
         events.append({"id":row["id"],"hostName":row["host_name"],"ruleName":row["rule_name"],"severity":row["severity"],"assigneeName":row["assignee_name"],"startedAt":row["started_at"].isoformat(),"deadlineAt":deadline.isoformat(),"remainingSeconds":remaining,"state":state,"unassignedOverdue":unassigned_overdue})
-    return {"policy":{"warningMinutes":policy["warning_minutes"],"criticalMinutes":policy["critical_minutes"],"unassignedMinutes":policy["unassigned_minutes"],"dueSoonPercent":policy["due_soon_percent"]},"summary":{"active":len(events),"overdue":sum(e["state"]=="overdue" for e in events),"dueSoon":sum(e["state"]=="due_soon" for e in events),"unassignedOverdue":sum(e["unassignedOverdue"] for e in events)},"events":events}
+    return {"policy":{"warningMinutes":policy["warning_minutes"],"criticalMinutes":policy["critical_minutes"],"unassignedMinutes":policy["unassigned_minutes"],"dueSoonPercent":policy["due_soon_percent"]},"summary":{"active":len(events),"overdue":sum(e["state"]=="overdue" for e in events),"dueSoon":sum(e["state"]=="due_soon" for e in events),"unassignedOverdue":sum(e["unassignedOverdue"] for e in events)},"events":events,"history":[{"id":h["id"],"hostName":h["host_name"],"ruleName":h["rule_name"],"breachType":h["breach_type"],"status":h["status"],"deliveryCount":h["delivery_count"],"detail":h["detail"],"breachedAt":h["breached_at"].isoformat(),"recoveredAt":h["recovered_at"].isoformat() if h["recovered_at"] else None} for h in history]}
 
 @app.get("/api/alert-ownership-sla")
 async def get_alert_ownership_sla(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_ownership_sla)
@@ -4967,6 +4971,34 @@ async def put_alert_ownership_sla_policy(payload:AlertOwnershipPolicyUpdate,requ
     actor=require_permission(request,"alerts.manage")
     with connect_db() as connection: connection.execute("UPDATE alert_ownership_policy SET warning_minutes=%s,critical_minutes=%s,unassigned_minutes=%s,due_soon_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.warning_minutes,payload.critical_minutes,payload.unassigned_minutes,payload.due_soon_percent,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"alerts.ownership.sla.update","更新告警責任 SLA",str(payload.model_dump())); return await asyncio.to_thread(read_alert_ownership_sla)
+
+def claim_alert_ownership_sla_breaches()->list[dict[str,Any]]:
+    claimed=[]
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM alert_ownership_policy WHERE id=1").fetchone()
+        connection.execute("""UPDATE alert_sla_escalations s SET status='recovered',recovered_at=NOW() FROM alert_events e WHERE e.id=s.alert_event_id AND s.status<>'recovered' AND (e.status<>'firing' OR e.acknowledged_at IS NOT NULL)""")
+        rows=connection.execute("""SELECT e.id,e.severity,e.message,e.started_at,e.assignee_id,h.name AS host_name,r.name AS rule_name FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id WHERE e.status='firing' AND e.acknowledged_at IS NULL AND NOT EXISTS(SELECT 1 FROM alert_sla_escalations s WHERE s.alert_event_id=e.id) ORDER BY e.started_at LIMIT 50""").fetchall()
+        now=datetime.now(timezone.utc)
+        for row in rows:
+            limit=policy["critical_minutes"] if row["severity"]=="critical" else policy["warning_minutes"]
+            unassigned=not row["assignee_id"] and now>=row["started_at"]+timedelta(minutes=policy["unassigned_minutes"])
+            deadline=now>=row["started_at"]+timedelta(minutes=limit)
+            if not unassigned and not deadline: continue
+            breach_type="unassigned" if unassigned else "ack_deadline"; sid=f"sla-{uuid.uuid4().hex[:20]}"
+            inserted=connection.execute("INSERT INTO alert_sla_escalations(id,alert_event_id,breach_type,status) VALUES(%s,%s,%s,'queued') ON CONFLICT(alert_event_id) DO NOTHING RETURNING id",(sid,row["id"],breach_type)).fetchone()
+            if inserted: claimed.append({"id":sid,"eventId":row["id"],"severity":row["severity"],"message":row["message"],"hostName":row["host_name"],"ruleName":row["rule_name"],"breachType":breach_type})
+    return claimed
+
+async def alert_ownership_sla_loop()->None:
+    while True:
+        try:
+            for item in await asyncio.to_thread(claim_alert_ownership_sla_breaches):
+                reason="未指派逾時" if item["breachType"]=="unassigned" else "確認期限逾時"
+                results=await dispatch_notifications([{"eventId":item["eventId"],"kind":"sla_breach","severity":item["severity"],"message":f"⏱ [責任 SLA 逾期] {reason}\n{item['hostName']} · {item['ruleName']}\n{item['message']}","retryKey":f"ownership-sla:{item['eventId']}"}])
+                enabled=any(channel["enabled"] for channel in notification_channels()); status="sent" if any(r["status"]=="sent" for r in results) else "failed" if results else "suppressed" if enabled else "no_channel"
+                with connect_db() as connection: connection.execute("UPDATE alert_sla_escalations SET status=%s,delivery_count=%s,detail=%s WHERE id=%s",(status,sum(r["status"]=="sent" for r in results),"責任 SLA 升級已處理",item["id"]))
+        except Exception as error: print(f"alert ownership SLA error: {error}",flush=True)
+        await asyncio.sleep(60)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:

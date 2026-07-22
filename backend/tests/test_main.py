@@ -359,6 +359,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/alert-ownership-sla',source); self.assertIn('unassigned_overdue',source); self.assertIn('state="overdue"',source)
         self.assertIn("告警責任時效",ui); self.assertIn("未指派逾時",ui); self.assertIn("即將逾期",ui)
 
+    def test_alert_ownership_sla_escalates_once_and_records_recovery(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"022_alert_sla_escalations.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("alert_sla_escalations",migration); self.assertIn("alert_event_id TEXT NOT NULL UNIQUE",migration); self.assertIn("recovered_at",migration)
+        self.assertIn("alert_ownership_sla_loop",source); self.assertIn("責任 SLA 逾期",source); self.assertIn("ON CONFLICT(alert_event_id) DO NOTHING",source)
+        self.assertIn("責任逾期升級紀錄",ui); self.assertIn("每個事件只發送一次",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
