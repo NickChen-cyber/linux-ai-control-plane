@@ -1,0 +1,11 @@
+node_modules
+dist
+.vinext
+.wrangler
+.git
+.env
+outputs
+work
+npm-debug.log*
+*.dump
+*.sql.gz

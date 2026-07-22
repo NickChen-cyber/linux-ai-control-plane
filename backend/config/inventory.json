@@ -1,0 +1,24 @@
+{
+  "hosts": [
+    {
+      "id": "server-1",
+      "name": "server-1",
+      "address": "192.168.0.152",
+      "port": 22,
+      "user": "linux-agent",
+      "group": "LAB / MANAGED",
+      "machine_id": "01d239c16b064ba08ec2326d78827de4",
+      "host_key_fingerprint": "SHA256:XYfrTU83PjhakIG9qD/YV3OwbOkNO9ILqCs3hoAnajI"
+    },
+    {
+      "id": "server-2",
+      "name": "server-2",
+      "address": "192.168.0.153",
+      "port": 22,
+      "user": "linux-agent",
+      "group": "LAB / MANAGED",
+      "machine_id": "c485ea29a0534b089a2640e8a9f71040",
+      "host_key_fingerprint": "SHA256:X8bq7NNZdBd278ZdgvZwuWwM4vctxIzv5nRAsSZ5bp8"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Linux AI Control Plane External Watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/linux-ai-watchdog.env
+ExecStart=/usr/local/sbin/linux-ai-external-watchdog
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
