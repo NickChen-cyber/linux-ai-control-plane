@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.1.0").strip() or "2.1.0"
-MIN_COMPATIBLE_SCHEMA = "013"
+APP_VERSION = os.getenv("APP_VERSION", "2.2.0").strip() or "2.2.0"
+MIN_COMPATIBLE_SCHEMA = "014"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -853,6 +853,10 @@ class NotificationRouteCreate(BaseModel):
 
 class NotificationRetryAction(BaseModel):
     note:str=Field(default="",max_length=500)
+
+class NotificationDeliveryPolicyUpdate(BaseModel):
+    window_days:int=Field(alias="windowDays",ge=1,le=90); success_target:float=Field(alias="successTarget",ge=50,le=100); minimum_samples:int=Field(alias="minimumSamples",ge=1,le=1000)
+    model_config={"populate_by_name":True}
 
 
 class WatchdogHeartbeat(BaseModel):
@@ -4680,6 +4684,27 @@ async def replay_all_failed_notifications(payload:NotificationRetryAction,reques
     actor=require_permission(request,"alerts.manage")
     with connect_db() as connection: ids=[row["id"] for row in connection.execute("SELECT id FROM notification_retry_jobs WHERE status='failed' ORDER BY created_at LIMIT 100").fetchall()]
     count=await asyncio.to_thread(act_on_notification_retries,ids,"replay",payload.note,actor["id"]); await asyncio.to_thread(record_backend_audit,request,"notifications.retry.replay_batch","批次重送失敗通知",str(count)); return {"queued":count}
+
+def read_notification_delivery_health()->dict[str,Any]:
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM notification_delivery_policy WHERE id=1").fetchone()
+        rows=connection.execute("""SELECT channel,COUNT(*) FILTER(WHERE status IN ('sent','failed')) AS attempts,COUNT(*) FILTER(WHERE status='sent') AS sent,COUNT(*) FILTER(WHERE status='failed') AS failed,COUNT(*) FILTER(WHERE status='suppressed') AS suppressed,MAX(attempted_at) FILTER(WHERE status='failed') AS last_failed_at FROM notification_deliveries WHERE attempted_at>=NOW()-(%s*INTERVAL '1 day') AND kind<>'test' GROUP BY channel ORDER BY channel""",(policy["window_days"],)).fetchall()
+        retry=connection.execute("SELECT COUNT(*) FILTER(WHERE status='sent') AS recovered,COUNT(*) FILTER(WHERE status='failed') AS exhausted,COUNT(*) FILTER(WHERE status='dismissed') AS dismissed FROM notification_retry_jobs WHERE created_at>=NOW()-(%s*INTERVAL '1 day') AND kind<>'test'",(policy["window_days"],)).fetchone()
+    channels=[]
+    for row in rows:
+        attempts=row["attempts"] or 0; rate=round(100*(row["sent"] or 0)/attempts,2) if attempts else None; enough=attempts>=policy["minimum_samples"]
+        channels.append({"channel":row["channel"],"attempts":attempts,"sent":row["sent"],"failed":row["failed"],"suppressed":row["suppressed"],"successRate":rate,"enoughSamples":enough,"met":enough and rate>=float(policy["success_target"]),"lastFailedAt":row["last_failed_at"].isoformat() if row["last_failed_at"] else None})
+    total_attempts=sum(item["attempts"] for item in channels); total_sent=sum(item["sent"] for item in channels); overall=round(100*total_sent/total_attempts,2) if total_attempts else None
+    return {"policy":{"windowDays":policy["window_days"],"successTarget":float(policy["success_target"]),"minimumSamples":policy["minimum_samples"],"updatedAt":policy["updated_at"].isoformat()},"summary":{"attempts":total_attempts,"sent":total_sent,"failed":sum(item["failed"] for item in channels),"suppressed":sum(item["suppressed"] for item in channels),"successRate":overall,"met":total_attempts>=policy["minimum_samples"] and overall>=float(policy["success_target"]),"recoveredRetries":retry["recovered"],"exhaustedRetries":retry["exhausted"],"dismissedRetries":retry["dismissed"]},"channels":channels}
+
+@app.get("/api/notification-delivery-health")
+async def notification_delivery_health(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_delivery_health)
+
+@app.put("/api/notification-delivery-health/policy")
+async def update_notification_delivery_policy(payload:NotificationDeliveryPolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE notification_delivery_policy SET window_days=%s,success_target=%s,minimum_samples=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.window_days,payload.success_target,payload.minimum_samples,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"notifications.delivery_slo.update","更新通知交付 SLO",str(payload.success_target)); return await asyncio.to_thread(read_notification_delivery_health)
 
 def read_notification_governance()->dict[str,Any]:
     with connect_db() as connection:

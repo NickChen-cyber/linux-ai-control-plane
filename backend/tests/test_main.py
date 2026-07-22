@@ -301,6 +301,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/notification-retries/{job_id}/replay',source); self.assertIn('/api/notification-retries/replay-failed',source)
         self.assertIn("通知失敗處理中心",ui); self.assertIn("忽略結案",ui)
 
+    def test_notification_delivery_slo_excludes_tests_and_suppression(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"014_notification_delivery_slo.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("notification_delivery_policy",migration); self.assertIn("success_target",migration)
+        self.assertIn("kind<>'test'",source); self.assertIn("status IN ('sent','failed')",source)
+        self.assertIn("通知交付健康度",ui); self.assertIn("最低樣本數",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
