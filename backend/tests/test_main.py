@@ -365,6 +365,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("alert_ownership_sla_loop",source); self.assertIn("責任 SLA 逾期",source); self.assertIn("ON CONFLICT(alert_event_id) DO NOTHING",source)
         self.assertIn("責任逾期升級紀錄",ui); self.assertIn("每個事件只發送一次",ui)
 
+    def test_on_call_handoff_updates_shift_and_preserves_chain(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"023_on_call_handoffs.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_handoffs",migration); self.assertIn("ON DELETE SET NULL",migration); self.assertIn("handed_off_by",migration)
+        self.assertIn('/api/on-call-handoffs',source); self.assertIn("FOR UPDATE",source); self.assertIn("代理人不可與目前值班人相同",source)
+        self.assertIn("值班交接與代理",ui); self.assertIn("交接原因",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

@@ -40,7 +40,7 @@ services:
     restart: unless-stopped
     environment:
       PGHOST: postgres
-      APP_VERSION: ${APP_VERSION:-3.0.0}
+      APP_VERSION: ${APP_VERSION:-3.1.0}
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-linux_ai}
       PGUSER: ${POSTGRES_USER:-linux_ai}
@@ -153,7 +153,7 @@ services:
       PGDATABASE: ${POSTGRES_DB:-linux_ai}
       PGUSER: ${POSTGRES_USER:-linux_ai}
       PGPASSWORD: ${POSTGRES_PASSWORD:-linux-ai-lab-only-change-me}
-      APP_VERSION: ${APP_VERSION:-3.0.0}
+      APP_VERSION: ${APP_VERSION:-3.1.0}
       INVENTORY_PATH: /app/config/inventory.json
       SSH_KEY_PATH: /run/ssh/linux_ai_agent
       KNOWN_HOSTS_PATH: /run/ssh/known_hosts

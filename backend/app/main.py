@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.0.0").strip() or "3.0.0"
-MIN_COMPATIBLE_SCHEMA = "022"
+APP_VERSION = os.getenv("APP_VERSION", "3.1.0").strip() or "3.1.0"
+MIN_COMPATIBLE_SCHEMA = "023"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -874,6 +874,10 @@ class AlertStormPolicyUpdate(BaseModel):
 
 class OnCallShiftCreate(BaseModel):
     user_id:str=Field(alias="userId",max_length=100); starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); note:str=Field(default="",max_length=500); enabled:bool=True
+    model_config={"populate_by_name":True}
+
+class OnCallHandoffCreate(BaseModel):
+    shift_id:str=Field(alias="shiftId",max_length=100); to_user_id:str=Field(alias="toUserId",max_length=100); reason:str=Field(min_length=2,max_length=500)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -4917,6 +4921,29 @@ async def delete_on_call_shift(shift_id:str,request:Request)->Response:
     with connect_db() as connection: row=connection.execute("DELETE FROM on_call_shifts WHERE id=%s RETURNING id",(shift_id,)).fetchone()
     if not row: raise HTTPException(status_code=404,detail="值班時段不存在")
     await asyncio.to_thread(record_backend_audit,request,"on_call.shift.delete","刪除值班時段",shift_id); return Response(status_code=204)
+
+def read_on_call_handoffs()->dict[str,Any]:
+    with connect_db() as connection:
+        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE ORDER BY display_name").fetchall()
+        shifts=connection.execute("""SELECT s.id,s.user_id,s.starts_at,s.ends_at,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND s.ends_at>NOW() ORDER BY s.starts_at LIMIT 100""").fetchall()
+        history=connection.execute("""SELECT h.*,old.display_name AS from_name,new.display_name AS to_name,actor.display_name AS actor_name,s.starts_at,s.ends_at FROM on_call_handoffs h LEFT JOIN platform_users old ON old.id=h.from_user_id LEFT JOIN platform_users new ON new.id=h.to_user_id LEFT JOIN platform_users actor ON actor.id=h.handed_off_by LEFT JOIN on_call_shifts s ON s.id=h.shift_id ORDER BY h.handed_off_at DESC LIMIT 100""").fetchall()
+    return {"users":[{"id":u["id"],"username":u["username"],"displayName":u["display_name"]} for u in users],"shifts":[{"id":s["id"],"userId":s["user_id"],"displayName":s["display_name"],"startsAt":s["starts_at"].isoformat(),"endsAt":s["ends_at"].isoformat()} for s in shifts],"history":[{"id":h["id"],"shiftId":h["shift_id"],"fromName":h["from_name"],"toName":h["to_name"],"actorName":h["actor_name"],"reason":h["reason"],"startsAt":h["starts_at"].isoformat() if h["starts_at"] else None,"endsAt":h["ends_at"].isoformat() if h["ends_at"] else None,"handedOffAt":h["handed_off_at"].isoformat()} for h in history]}
+
+@app.get("/api/on-call-handoffs")
+async def list_on_call_handoffs(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_handoffs)
+
+@app.post("/api/on-call-handoffs",status_code=201)
+async def create_on_call_handoff(payload:OnCallHandoffCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection:
+        shift=connection.execute("SELECT id,user_id FROM on_call_shifts WHERE id=%s AND enabled=TRUE AND ends_at>NOW() FOR UPDATE",(payload.shift_id,)).fetchone()
+        if not shift: raise HTTPException(status_code=404,detail="可交接的值班班次不存在或已結束")
+        if shift["user_id"]==payload.to_user_id: raise HTTPException(status_code=409,detail="代理人不可與目前值班人相同")
+        user=connection.execute("SELECT id FROM platform_users WHERE id=%s AND enabled=TRUE",(payload.to_user_id,)).fetchone()
+        if not user: raise HTTPException(status_code=404,detail="代理使用者不存在或已停用")
+        connection.execute("INSERT INTO on_call_handoffs(id,shift_id,from_user_id,to_user_id,reason,handed_off_by) VALUES(%s,%s,%s,%s,%s,%s)",(f"hof-{uuid.uuid4().hex[:20]}",shift["id"],shift["user_id"],payload.to_user_id,payload.reason.strip(),actor["id"]))
+        connection.execute("UPDATE on_call_shifts SET user_id=%s WHERE id=%s",(payload.to_user_id,shift["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"on_call.handoff.create","值班交接",payload.shift_id); return await asyncio.to_thread(read_on_call_handoffs)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:
