@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.6.0-alert-storm-protection.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.7.0-on-call-scheduling.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -83,6 +83,10 @@ Schema 應為 `017`。相依抑制實際命中後，「根因關聯視圖」應�
 ## 2.6.0 升級後驗證
 
 Schema 應為 `018`。告警中心應顯示預設 5 分鐘／5 事件／15 分鐘冷卻政策；一般環境沒有風暴時顯示「尚無告警風暴」是正常狀態。
+
+## 2.7.0 升級後驗證
+
+Schema 應為 `019`。建立涵蓋目前時間的值班班次後，下一個新告警應自動顯示該負責人，值班頁的指派歷史也會新增一筆。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.6.0").strip() or "2.6.0"
-MIN_COMPATIBLE_SCHEMA = "018"
+APP_VERSION = os.getenv("APP_VERSION", "2.7.0").strip() or "2.7.0"
+MIN_COMPATIBLE_SCHEMA = "019"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -870,6 +870,10 @@ class AlertInhibitionCreate(BaseModel):
 
 class AlertStormPolicyUpdate(BaseModel):
     enabled:bool; window_minutes:int=Field(alias="windowMinutes",ge=1,le=60); event_threshold:int=Field(alias="eventThreshold",ge=2,le=100); cooldown_minutes:int=Field(alias="cooldownMinutes",ge=1,le=240)
+    model_config={"populate_by_name":True}
+
+class OnCallShiftCreate(BaseModel):
+    user_id:str=Field(alias="userId",max_length=100); starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); note:str=Field(default="",max_length=500); enabled:bool=True
     model_config={"populate_by_name":True}
 
 
@@ -3940,6 +3944,17 @@ def evaluate_alert_storm(intent:dict[str,Any])->dict[str,Any]|None:
             connection.execute("UPDATE alert_storms SET event_count=GREATEST(event_count,%s),last_event_at=NOW() WHERE id=%s",(count,storm["id"])); return {"action":"suppress","id":storm["id"],"count":count}
         storm_id=f"stm-{uuid.uuid4().hex[:20]}"; connection.execute("INSERT INTO alert_storms(id,host_id,status,event_count,summary_sent_at) VALUES(%s,%s,'active',%s,NOW())",(storm_id,event["host_id"],count)); return {"action":"summary","id":storm_id,"count":count}
 
+def assign_alert_to_on_call(intent:dict[str,Any])->dict[str,Any]|None:
+    if intent.get("kind")!="firing" or not intent.get("eventId"): return None
+    with connect_db() as connection:
+        event=connection.execute("SELECT id,assignee_id FROM alert_events WHERE id=%s",(intent["eventId"],)).fetchone()
+        if not event or event["assignee_id"]: return None
+        shift=connection.execute("SELECT s.id,s.user_id,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND u.locked=FALSE AND s.starts_at<=NOW() AND s.ends_at>NOW() ORDER BY s.starts_at DESC LIMIT 1").fetchone()
+        if not shift: return None
+        row=connection.execute("UPDATE alert_events SET assignee_id=%s,updated_at=NOW() WHERE id=%s AND assignee_id IS NULL RETURNING id",(shift["user_id"],event["id"])).fetchone()
+        if not row: return None
+        connection.execute("INSERT INTO alert_assignments(id,alert_event_id,user_id,shift_id) VALUES(%s,%s,%s,%s) ON CONFLICT(alert_event_id) DO NOTHING",(f"asn-{uuid.uuid4().hex[:20]}",event["id"],shift["user_id"],shift["id"])); return {"userId":shift["user_id"],"displayName":shift["display_name"],"shiftId":shift["id"]}
+
 
 async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     enabled = [channel["id"] for channel in notification_channels() if channel["enabled"]]
@@ -3948,6 +3963,8 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
     pairs: list[tuple[str, dict[str, Any]]] = []
     for intent in intents:
         intent.setdefault("retryKey", str(uuid.uuid4()))
+        assignment=await asyncio.to_thread(assign_alert_to_on_call,intent)
+        if assignment: intent["message"]+=f"\n值班負責人：{assignment['displayName']}"
         storm=await asyncio.to_thread(evaluate_alert_storm,intent)
         if storm and storm["action"]=="summary": intent["message"]=f"🌪️ [告警風暴摘要]\n同一主機在短時間內已有 {storm['count']} 個告警事件\n最新事件：{intent['message']}"
         selected,route,rendered=await asyncio.to_thread(resolve_notification_route,intent,enabled)
@@ -4859,6 +4876,35 @@ async def update_alert_storm_policy(payload:AlertStormPolicyUpdate,request:Reque
     actor=require_permission(request,"alerts.manage")
     with connect_db() as connection: connection.execute("UPDATE alert_storm_policy SET enabled=%s,window_minutes=%s,event_threshold=%s,cooldown_minutes=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.enabled,payload.window_minutes,payload.event_threshold,payload.cooldown_minutes,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"alerts.storm.policy.update","更新告警風暴政策",str(payload.enabled)); return await asyncio.to_thread(read_alert_storms)
+
+def read_on_call_schedule()->dict[str,Any]:
+    with connect_db() as connection:
+        shifts=connection.execute("SELECT s.*,u.username,u.display_name,s.starts_at<=NOW() AND s.ends_at>NOW() AND s.enabled AS active FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id ORDER BY CASE WHEN s.ends_at>NOW() THEN 0 ELSE 1 END,s.starts_at LIMIT 100").fetchall()
+        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE AND locked=FALSE ORDER BY display_name").fetchall()
+        assignments=connection.execute("SELECT a.id,a.alert_event_id,a.assigned_at,u.display_name,h.name AS host_name,r.name AS rule_name FROM alert_assignments a JOIN platform_users u ON u.id=a.user_id JOIN alert_events e ON e.id=a.alert_event_id JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id ORDER BY a.assigned_at DESC LIMIT 50").fetchall()
+    return {"users":[{"id":u["id"],"username":u["username"],"displayName":u["display_name"]} for u in users],"shifts":[{"id":s["id"],"userId":s["user_id"],"username":s["username"],"displayName":s["display_name"],"startsAt":s["starts_at"].isoformat(),"endsAt":s["ends_at"].isoformat(),"note":s["note"],"enabled":s["enabled"],"active":s["active"]} for s in shifts],"assignments":[{"id":a["id"],"alertEventId":a["alert_event_id"],"displayName":a["display_name"],"hostName":a["host_name"],"ruleName":a["rule_name"],"assignedAt":a["assigned_at"].isoformat()} for a in assignments]}
+
+@app.get("/api/on-call")
+async def list_on_call(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_schedule)
+
+@app.post("/api/on-call/shifts",status_code=201)
+async def create_on_call_shift(payload:OnCallShiftCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    if payload.ends_at<=payload.starts_at: raise HTTPException(status_code=422,detail="值班結束時間必須晚於開始時間")
+    with connect_db() as connection:
+        user=connection.execute("SELECT 1 FROM platform_users WHERE id=%s AND enabled=TRUE AND locked=FALSE",(payload.user_id,)).fetchone()
+        if not user: raise HTTPException(status_code=404,detail="值班使用者不存在或不可用")
+        overlap=connection.execute("SELECT 1 FROM on_call_shifts WHERE enabled=TRUE AND starts_at<%s AND ends_at>%s",(payload.ends_at,payload.starts_at)).fetchone()
+        if overlap: raise HTTPException(status_code=409,detail="此時段已有其他值班人員")
+        connection.execute("INSERT INTO on_call_shifts(id,user_id,starts_at,ends_at,note,enabled,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s)",(f"shf-{uuid.uuid4().hex[:20]}",payload.user_id,payload.starts_at,payload.ends_at,payload.note or None,payload.enabled,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"on_call.shift.create","建立值班時段",payload.user_id); return await asyncio.to_thread(read_on_call_schedule)
+
+@app.delete("/api/on-call/shifts/{shift_id}",status_code=204)
+async def delete_on_call_shift(shift_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: row=connection.execute("DELETE FROM on_call_shifts WHERE id=%s RETURNING id",(shift_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="值班時段不存在")
+    await asyncio.to_thread(record_backend_audit,request,"on_call.shift.delete","刪除值班時段",shift_id); return Response(status_code=204)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:

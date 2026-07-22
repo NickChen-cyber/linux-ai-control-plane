@@ -331,6 +331,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("evaluate_alert_storm",source); self.assertIn("告警風暴摘要",source); self.assertIn("告警風暴保護：",source)
         self.assertIn("告警風暴保護",ui); self.assertIn("冷卻時間",ui)
 
+    def test_on_call_shift_assigns_new_alerts_without_notification_dependency(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"019_on_call_scheduling.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_shifts",migration); self.assertIn("alert_assignments",migration); self.assertIn("UNIQUE REFERENCES alert_events",migration.replace("alert_event_id TEXT NOT NULL ",""))
+        self.assertIn("assign_alert_to_on_call",source); self.assertIn("assignee_id IS NULL",source)
+        self.assertIn("值班排程與自動指派",ui); self.assertIn("永久指派歷史",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

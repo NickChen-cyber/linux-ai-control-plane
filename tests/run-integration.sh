@@ -44,6 +44,7 @@ request GET /api/maintenance-windows | python3 -c 'import json,sys; assert isins
 request GET /api/alert-inhibitions | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["inhibitions"],list)'
 request GET /api/alert-correlations | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["correlations"],list)'
 request GET /api/alert-storms | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "storms" in d'
+request GET /api/on-call | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "shifts" in d and "assignments" in d'
 host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
 request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 
