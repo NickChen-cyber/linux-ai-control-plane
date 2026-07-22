@@ -371,6 +371,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/on-call-handoffs',source); self.assertIn("FOR UPDATE",source); self.assertIn("代理人不可與目前值班人相同",source)
         self.assertIn("值班交接與代理",ui); self.assertIn("交接原因",ui)
 
+    def test_on_call_coverage_merges_shifts_and_reports_gaps(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"024_on_call_coverage.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_coverage_policy",migration); self.assertIn("horizon_hours",migration); self.assertIn("target_percent",migration)
+        self.assertIn('/api/on-call-coverage',source); self.assertIn("intervals[-1][1]",source); self.assertIn("uncoveredMinutes",source)
+        self.assertIn("值班覆蓋率與缺口",ui); self.assertIn("觀察範圍內沒有值班缺口",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

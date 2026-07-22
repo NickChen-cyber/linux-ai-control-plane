@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.1.0").strip() or "3.1.0"
-MIN_COMPATIBLE_SCHEMA = "023"
+APP_VERSION = os.getenv("APP_VERSION", "3.2.0").strip() or "3.2.0"
+MIN_COMPATIBLE_SCHEMA = "024"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -878,6 +878,10 @@ class OnCallShiftCreate(BaseModel):
 
 class OnCallHandoffCreate(BaseModel):
     shift_id:str=Field(alias="shiftId",max_length=100); to_user_id:str=Field(alias="toUserId",max_length=100); reason:str=Field(min_length=2,max_length=500)
+    model_config={"populate_by_name":True}
+
+class OnCallCoveragePolicyUpdate(BaseModel):
+    horizon_hours:int=Field(alias="horizonHours",ge=1,le=720); target_percent:float=Field(alias="targetPercent",ge=1,le=100)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -4944,6 +4948,33 @@ async def create_on_call_handoff(payload:OnCallHandoffCreate,request:Request)->d
         connection.execute("INSERT INTO on_call_handoffs(id,shift_id,from_user_id,to_user_id,reason,handed_off_by) VALUES(%s,%s,%s,%s,%s,%s)",(f"hof-{uuid.uuid4().hex[:20]}",shift["id"],shift["user_id"],payload.to_user_id,payload.reason.strip(),actor["id"]))
         connection.execute("UPDATE on_call_shifts SET user_id=%s WHERE id=%s",(payload.to_user_id,shift["id"]))
     await asyncio.to_thread(record_backend_audit,request,"on_call.handoff.create","值班交接",payload.shift_id); return await asyncio.to_thread(read_on_call_handoffs)
+
+def read_on_call_coverage()->dict[str,Any]:
+    now=datetime.now(timezone.utc)
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM on_call_coverage_policy WHERE id=1").fetchone(); end=now+timedelta(hours=policy["horizon_hours"])
+        rows=connection.execute("""SELECT s.starts_at,s.ends_at,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND s.ends_at>%s AND s.starts_at<%s ORDER BY s.starts_at""",(now,end)).fetchall()
+    intervals=[]
+    for row in rows:
+        start=max(now,row["starts_at"]); finish=min(end,row["ends_at"])
+        if not intervals or start>intervals[-1][1]: intervals.append([start,finish])
+        else: intervals[-1][1]=max(intervals[-1][1],finish)
+    gaps=[]; cursor=now
+    for start,finish in intervals:
+        if start>cursor: gaps.append({"startsAt":cursor.isoformat(),"endsAt":start.isoformat(),"durationMinutes":round((start-cursor).total_seconds()/60)})
+        cursor=max(cursor,finish)
+    if cursor<end: gaps.append({"startsAt":cursor.isoformat(),"endsAt":end.isoformat(),"durationMinutes":round((end-cursor).total_seconds()/60)})
+    total=policy["horizon_hours"]*3600; uncovered=sum(g["durationMinutes"]*60 for g in gaps); coverage=round(max(0,100*(total-uncovered)/total),2)
+    return {"policy":{"horizonHours":policy["horizon_hours"],"targetPercent":float(policy["target_percent"])},"summary":{"coveragePercent":coverage,"targetMet":coverage>=float(policy["target_percent"]),"gapCount":len(gaps),"uncoveredMinutes":round(uncovered/60)},"gaps":gaps}
+
+@app.get("/api/on-call-coverage")
+async def get_on_call_coverage(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_coverage)
+
+@app.put("/api/on-call-coverage/policy")
+async def put_on_call_coverage_policy(payload:OnCallCoveragePolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE on_call_coverage_policy SET horizon_hours=%s,target_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.horizon_hours,payload.target_percent,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"on_call.coverage.policy.update","更新值班覆蓋政策",str(payload.model_dump())); return await asyncio.to_thread(read_on_call_coverage)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:
