@@ -643,7 +643,15 @@ MFA 設定、復原碼輪替、MFA 停用、祕密新增／輪替／刪除、SSH
 - Worker 使用 `FOR UPDATE SKIP LOCKED` 安全領取工作、回報心跳，並維持同一台主機同時最多一個維運任務。UI 可取消排隊或執行中的工作。
 - `API_RATE_LIMIT_PER_MINUTE` 與 `SSH_MAX_CONCURRENCY` 控制中央負載；Compose 另對 PostgreSQL、API、Worker、備份、UI 與 Gateway 設置 CPU、記憶體及 PID 上限。
 - 「備份管理」可調整告警、維運、效能、巡檢、盤點、登入與中央日誌的保存期限，先預覽再清理。稽核鏈預設保留 3,650 天且標記為受保護，不接受 UI 清理。
-- `tests/test-migrations.sh` 驗證 001 → 002 → 003 及 003 rollback；`tests/run-integration.sh` 可在 AiAgnet 驗證真實登入、主機、Worker、備份、保存政策與 Schema。
+- `tests/test-migrations.sh` 驗證正式 migration 與 rollback；`tests/run-integration.sh` 可在 AiAgnet 驗證真實登入、主機、Worker、備份、保存政策與 Schema。
+
+## 1.2 第三階段：可觀測性與容量預測
+
+- 「容量與服務」每 30 秒更新畫面，中央每 5 分鐘保存 PostgreSQL、備份 Worker、維運 Worker、任務佇列與資料庫容量狀態。
+- 以最近 7 天 `host_metric_samples` 的線性趨勢估算 CPU、記憶體及磁碟每日變化，並顯示樣本數與低／中／高可信度。
+- 預設資源可能在 14 天內達到 85% 時建立 `rule-capacity-forecast` 系統告警；可在告警中心調整預測天數與嚴重程度，但不可刪除或改成其他監控項目。
+- Worker 容器重建後，舊登錄會先顯示離線並於 10 分鐘後清除；在線判斷仍使用 30 秒心跳門檻。
+- 容量預測只提供提前規劃依據，不會自動擴容、刪除資料或修改遠端 Linux。
 
 ### 正式安裝檢查
 

@@ -15,6 +15,7 @@ import "@xterm/xterm/css/xterm.css";
 type View =
   | "overview"
   | "health"
+  | "observability"
   | "security"
   | "hosts"
   | "assets"
@@ -75,6 +76,7 @@ type HostRow = {
 const views: Array<{ id: View; label: string }> = [
   { id: "overview", label: "營運總覽" },
   { id: "health", label: "平台健檢" },
+  { id: "observability", label: "容量與服務" },
   { id: "security", label: "安全中心" },
   { id: "hosts", label: "主機監控" },
   { id: "assets", label: "資產盤點" },
@@ -559,6 +561,7 @@ function AuthenticatedConsole({
                 (item.id !== "diagnostics" || can("ai.read")) &&
                 (item.id !== "tasks" || can("tasks.read")) &&
                 (item.id !== "health" || can("audit.read")) &&
+                (item.id !== "observability" || can("audit.read")) &&
                 (item.id !== "security" || can("access.manage")) &&
                 (item.id !== "patches" || can("hosts.read")) &&
                 (item.id !== "baseline" || can("hosts.read")) &&
@@ -635,6 +638,7 @@ function AuthenticatedConsole({
             />
           )}
           {view === "health" && can("audit.read") && <PlatformHealth canRelease={can("backup.manage")} record={record} />}
+          {view === "observability" && can("audit.read") && <ObservabilityCenter />}
           {view === "security" && can("access.manage") && <SecurityCenter />}
           {view === "hosts" && (
             <Hosts
@@ -1005,6 +1009,18 @@ function PlatformHealth({canRelease,record}:{canRelease:boolean;record:(type:str
       {!checks.length && !error && <div className="card empty-state page-empty"><strong>正在取得中央平台狀態…</strong></div>}
     </section>
   );
+}
+
+type ServiceObservation={service:string;status:"healthy"|"warning"|"critical";metrics:Record<string,number>;detail:string;collectedAt:string};
+type CapacityForecast={hostId:string;hostName:string;resource:"cpu"|"ram"|"disk";currentPercent:number;slopePerDay:number;thresholdPercent:number;predictedDays:number|null;sampleCount:number;confidence:"low"|"medium"|"high";calculatedAt:string};
+type WorkerObservation={id:string;version:string;concurrency:number;activeTasks:number;online:boolean;lastHeartbeatAt:string};
+
+function ObservabilityCenter(){
+  const [services,setServices]=useState<ServiceObservation[]>([]);const [forecasts,setForecasts]=useState<CapacityForecast[]>([]);const [workers,setWorkers]=useState<WorkerObservation[]>([]);const [loading,setLoading]=useState(false);const [error,setError]=useState("");
+  const load=useCallback(async(refresh=false)=>{setLoading(true);try{const response=await fetch(`/api/observability${refresh?"?refresh=true":""}`,{cache:"no-store"});const body=await response.json() as {services?:ServiceObservation[];forecasts?:CapacityForecast[];workers?:WorkerObservation[];detail?:string};if(!response.ok)throw new Error(body.detail||"無法讀取可觀測性資料");setServices(body.services??[]);setForecasts(body.forecasts??[]);setWorkers(body.workers??[]);setError("");}catch(reason){setError(reason instanceof Error?reason.message:"載入失敗");}finally{setLoading(false)}},[]);
+  useEffect(()=>{void load();const timer=window.setInterval(()=>void load(),30000);return()=>window.clearInterval(timer)},[load]);
+  const labels={postgres:"PostgreSQL", "maintenance-worker":"維運 Worker", "backup-worker":"備份 Worker"};const resources={cpu:"CPU",ram:"記憶體",disk:"磁碟"};
+  return <section className="observability-page"><div className="card observability-heading"><div className="page-heading"><div><small>SERVICE OBSERVABILITY & CAPACITY</small><h2>中央服務與容量預測</h2><p>整合 Worker 心跳、任務佇列、資料庫容量及最近 7 天主機資源趨勢。</p></div><button className="create" disabled={loading} onClick={()=>void load(true)}>{loading?"計算中…":"立即重新計算"}</button></div>{error&&<div className="log-error">{error}</div>}</div><div className="service-observations">{services.map(item=><article className={`card ${item.status}`} key={item.service}><header><span>{item.status==="healthy"?"✓":"!"}</span><div><small>SERVICE</small><strong>{labels[item.service as keyof typeof labels]||item.service}</strong></div></header><p>{item.detail}</p><dl>{Object.entries(item.metrics).map(([key,value])=><div key={key}><dt>{key}</dt><dd>{Number(value).toLocaleString()}</dd></div>)}</dl><footer>{new Date(item.collectedAt).toLocaleString("zh-TW",{hour12:false})}</footer></article>)}</div><div className="card capacity-center"><header className="alert-section-head"><div><small>7-DAY LINEAR FORECAST</small><h2>受管主機容量趨勢</h2></div><span>門檻 85% · 14 天內告警</span></header><div className="data-table"><table><thead><tr><th>主機</th><th>資源</th><th>目前</th><th>每日變化</th><th>預計達門檻</th><th>可信度</th><th>樣本</th></tr></thead><tbody>{forecasts.map(item=><tr key={`${item.hostId}-${item.resource}`}><td><strong>{item.hostName}</strong></td><td>{resources[item.resource]}</td><td>{item.currentPercent.toFixed(1)}%</td><td className={item.slopePerDay>0.05?"warn":"ok"}>{item.slopePerDay>=0?"+":""}{item.slopePerDay.toFixed(2)}%／天</td><td><span className={`forecast-risk ${item.predictedDays!==null&&item.predictedDays<=14?"urgent":"stable"}`}>{item.predictedDays===null?"趨勢穩定":item.predictedDays<=0?"已達門檻":`${item.predictedDays.toFixed(1)} 天`}</span></td><td>{({low:"低",medium:"中",high:"高"} as const)[item.confidence]}</td><td>{item.sampleCount}</td></tr>)}</tbody></table></div>{!forecasts.length&&<div className="empty-state"><strong>尚無足夠的效能樣本</strong><small>平台持續採集後會自動建立最近 7 天容量趨勢。</small></div>}</div><div className="card worker-registry"><header className="alert-section-head"><div><small>PERSISTENT WORKER REGISTRY</small><h2>Worker 登錄狀態</h2></div><span>超過 10 分鐘未回報會自動清理</span></header>{workers.map(worker=><article key={worker.id}><div><strong>{worker.id}</strong><small>v{worker.version}</small></div><span className={`watchdog-status ${worker.online?"online":"stale"}`}>{worker.online?"在線":"離線"}</span><div><strong>{worker.activeTasks} / {worker.concurrency}</strong><small>執行中／並行上限</small></div><time>{new Date(worker.lastHeartbeatAt).toLocaleString("zh-TW",{hour12:false})}</time></article>)}</div></section>;
 }
 
 type SecuritySession = {
@@ -1865,7 +1881,7 @@ function Logs({
 type AlertRule = {
   id: string;
   name: string;
-  metric: "availability" | "cpu" | "ram" | "disk" | "failed_services" | "log_collection" | "asset_drift" | "security_updates" | "security_baseline";
+  metric: "availability" | "cpu" | "ram" | "disk" | "failed_services" | "log_collection" | "asset_drift" | "security_updates" | "security_baseline" | "capacity_forecast";
   threshold: number;
   consecutiveSamples: number;
   severity: "warning" | "critical";
@@ -1946,6 +1962,7 @@ const alertMetricNames: Record<AlertRule["metric"], string> = {
   asset_drift: "主機資產設定漂移",
   security_updates: "安全更新待處理",
   security_baseline: "主機安全基準分數",
+  capacity_forecast: "容量預測天數",
 };
 
 function Alerts({
@@ -2452,11 +2469,11 @@ function Alerts({
                 <tr key={rule.id}>
                   <td><strong>{rule.name}</strong></td>
                   <td>{alertMetricNames[rule.metric]}</td>
-                  <td>{rule.metric === "availability" ? "離線" : rule.metric === "failed_services" ? `${rule.threshold} 個` : rule.metric === "log_collection" ? `${rule.consecutiveSamples} 次` : rule.metric === "asset_drift" ? "偵測到變更" : rule.metric === "security_updates" ? `${rule.threshold} 項` : rule.metric === "security_baseline" ? `${rule.threshold} 分` : `${rule.threshold}%`}</td>
+                  <td>{rule.metric === "availability" ? "離線" : rule.metric === "failed_services" ? `${rule.threshold} 個` : rule.metric === "log_collection" ? `${rule.consecutiveSamples} 次` : rule.metric === "asset_drift" ? "偵測到變更" : rule.metric === "security_updates" ? `${rule.threshold} 項` : rule.metric === "security_baseline" ? `${rule.threshold} 分` : rule.metric === "capacity_forecast" ? `${rule.threshold} 天內` : `${rule.threshold}%`}</td>
                   <td>{rule.consecutiveSamples} 次</td>
                   <td><span className={`alert-severity ${rule.severity}`}>{rule.severity === "critical" ? "嚴重" : "警告"}</span></td>
                   <td>{rule.enabled ? "啟用" : "停用"}</td>
-                  <td>{canManage && <span className="row-actions"><button className="table-action" onClick={() => setEditingRule(rule)}>修改</button>{!["log_collection","asset_drift","security_updates","security_baseline"].includes(rule.metric)&&<button className="table-action danger-action" onClick={() => void removeRule(rule)}>刪除</button>}</span>}</td>
+                  <td>{canManage && <span className="row-actions"><button className="table-action" onClick={() => setEditingRule(rule)}>修改</button>{!["log_collection","asset_drift","security_updates","security_baseline","capacity_forecast"].includes(rule.metric)&&<button className="table-action danger-action" onClick={() => void removeRule(rule)}>刪除</button>}</span>}</td>
                 </tr>
               ))}
             </tbody>
@@ -2472,7 +2489,7 @@ function Alerts({
             <h2>{editingRule === "new" ? "新增告警規則" : "修改告警規則"}</h2>
             <p>必須連續達到指定次數才建立告警，短暫波動不會立即通知。</p>
             <label>規則名稱<input name="name" defaultValue={editingRule === "new" ? "" : editingRule.name} required /></label>
-            <label>監控項目<select name="metric" defaultValue={editingRule === "new" ? "cpu" : editingRule.metric} disabled={editingRule!=="new"&&["log_collection","asset_drift","security_updates","security_baseline"].includes(editingRule.metric)}>{Object.entries(alertMetricNames).filter(([value])=>editingRule!=="new"||!["log_collection","asset_drift","security_updates","security_baseline"].includes(value)).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{editingRule!=="new"&&["log_collection","asset_drift","security_updates","security_baseline"].includes(editingRule.metric)&&<input type="hidden" name="metric" value={editingRule.metric} />}</label>
+            <label>監控項目<select name="metric" defaultValue={editingRule === "new" ? "cpu" : editingRule.metric} disabled={editingRule!=="new"&&["log_collection","asset_drift","security_updates","security_baseline","capacity_forecast"].includes(editingRule.metric)}>{Object.entries(alertMetricNames).filter(([value])=>editingRule!=="new"||!["log_collection","asset_drift","security_updates","security_baseline","capacity_forecast"].includes(value)).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{editingRule!=="new"&&["log_collection","asset_drift","security_updates","security_baseline","capacity_forecast"].includes(editingRule.metric)&&<input type="hidden" name="metric" value={editingRule.metric} />}</label>
             <div className="form-pair">
               <label>門檻值<input name="threshold" type="number" min="0" step="0.1" defaultValue={editingRule === "new" ? 80 : editingRule.threshold} required /></label>
               <label>連續樣本<input name="consecutiveSamples" type="number" min="1" max="60" defaultValue={editingRule === "new" ? 2 : editingRule.consecutiveSamples} required /></label>

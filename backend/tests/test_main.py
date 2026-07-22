@@ -66,6 +66,21 @@ class AuditChainTests(unittest.TestCase):
         self.assertNotIn('row["task_count"]', rules_block)
         self.assertIn('"taskCount": row["task_count"]', events_block)
 
+    def test_stage3_observability_capacity_and_worker_registry(self):
+        project = Path(__file__).parents[2]
+        source = (project / "backend" / "app" / "main.py").read_text()
+        worker = (project / "backend" / "app" / "maintenance_worker.py").read_text()
+        migration = (project / "backend" / "migrations" / "004_observability_capacity.sql").read_text()
+        ui = (project / "app" / "console.tsx").read_text()
+        self.assertIn("service_health_samples", migration)
+        self.assertIn("capacity_forecasts", migration)
+        self.assertIn("capacity_forecast", migration)
+        self.assertIn('/api/observability', source)
+        self.assertIn("regr_slope", source)
+        self.assertIn("observability_loop", source)
+        self.assertIn("INTERVAL '10 minutes'", worker)
+        self.assertIn("中央服務與容量預測", ui)
+
     def test_postgresql_schema_has_required_types_and_indexes(self):
         schema = (Path(__file__).parents[1] / "sql" / "001_init.sql").read_text()
         self.assertIn("TIMESTAMPTZ", schema)
@@ -457,7 +472,7 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/logs/export.csv', source)
         self.assertIn('/api/logs/policy', source)
         self.assertIn("rule-log-collection", source)
-        self.assertIn("metric NOT IN ('log_collection','asset_drift','security_updates','security_baseline')", source)
+        self.assertIn("metric NOT IN ('log_collection','asset_drift','security_updates','security_baseline','capacity_forecast')", source)
         self.assertIn("集中日誌連續 {failures} 次採集失敗", source)
         self.assertIn("全部主機", ui)
         self.assertIn("匯出 CSV", ui)

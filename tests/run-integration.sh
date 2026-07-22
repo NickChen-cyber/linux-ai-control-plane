@@ -31,6 +31,7 @@ request GET /api/backups | python3 -c 'import json,sys; d=json.load(sys.stdin); 
 request GET /api/system/version | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["compatible"] and not d["schema"]["pending"]'
 request GET /api/system/limits | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["apiRateLimitPerMinute"] >= 30 and d["sshMaxConcurrency"] >= 1'
 request GET /api/retention | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(p["dataset"]=="audit_events" and p["protected"] for p in d["policies"])'
+request GET /api/observability | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "services" in d and "forecasts" in d and "workers" in d'
 
 if [ "${INTEGRATION_MUTATIONS:-0}" = 1 ]; then
   request POST /api/monitoring/collect | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'

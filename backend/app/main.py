@@ -40,8 +40,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.1.0").strip() or "1.1.0"
-MIN_COMPATIBLE_SCHEMA = "003"
+APP_VERSION = os.getenv("APP_VERSION", "1.2.0").strip() or "1.2.0"
+MIN_COMPATIBLE_SCHEMA = "004"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -806,7 +806,7 @@ class WatchdogHeartbeat(BaseModel):
 
 class AlertRuleCreate(BaseModel):
     name: str = Field(min_length=2, max_length=80)
-    metric: str = Field(pattern="^(availability|cpu|ram|disk|failed_services|log_collection|asset_drift|security_updates|security_baseline)$")
+    metric: str = Field(pattern="^(availability|cpu|ram|disk|failed_services|log_collection|asset_drift|security_updates|security_baseline|capacity_forecast)$")
     threshold: float = Field(default=1, ge=0, le=100000)
     consecutive_samples: int = Field(alias="consecutiveSamples", default=2, ge=1, le=60)
     severity: str = Field(pattern="^(warning|critical)$")
@@ -1533,7 +1533,7 @@ def initialize_db() -> None:
             """
         )
         connection.execute("ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_metric_check")
-        connection.execute("ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_metric_check CHECK (metric IN ('availability','cpu','ram','disk','failed_services','log_collection','asset_drift','security_updates','security_baseline'))")
+        connection.execute("ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_metric_check CHECK (metric IN ('availability','cpu','ram','disk','failed_services','log_collection','asset_drift','security_updates','security_baseline','capacity_forecast'))")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS alert_events (
@@ -2012,6 +2012,7 @@ async def lifespan(_: FastAPI):
     security_baseline_task = asyncio.create_task(security_baseline_loop(), name="security-baseline-monitor")
     maintenance_reaper_task = asyncio.create_task(maintenance_reaper_loop(), name="maintenance-task-reaper")
     retention_task = asyncio.create_task(retention_cleanup_loop(), name="data-retention-worker")
+    observability_task = asyncio.create_task(observability_loop(), name="service-observability-worker")
     try:
         yield
     finally:
@@ -2024,6 +2025,7 @@ async def lifespan(_: FastAPI):
         security_baseline_task.cancel()
         maintenance_reaper_task.cancel()
         retention_task.cancel()
+        observability_task.cancel()
         try:
             await asyncio.gather(
                 monitor_task, backup_notification_task, notification_retry_task, central_log_task,
@@ -2032,6 +2034,7 @@ async def lifespan(_: FastAPI):
                 security_baseline_task,
                 maintenance_reaper_task,
                 retention_task,
+                observability_task,
             )
         except asyncio.CancelledError:
             pass
@@ -3854,7 +3857,7 @@ def persist_sample_and_evaluate(
         rules = connection.execute(
             """
             SELECT id, name, metric, threshold, consecutive_samples, severity
-            FROM alert_rules WHERE enabled = TRUE AND metric NOT IN ('log_collection','asset_drift','security_updates','security_baseline') ORDER BY created_at
+            FROM alert_rules WHERE enabled = TRUE AND metric NOT IN ('log_collection','asset_drift','security_updates','security_baseline','capacity_forecast') ORDER BY created_at
             """
         ).fetchall()
         for rule in rules:
@@ -5168,6 +5171,128 @@ async def execute_retention(request: Request) -> dict[str, Any]:
     return result
 
 
+def refresh_observability() -> None:
+    now = datetime.now(timezone.utc)
+    with connect_db() as connection:
+        worker = connection.execute(
+            "SELECT id,active_tasks,last_heartbeat_at FROM maintenance_workers ORDER BY last_heartbeat_at DESC LIMIT 1"
+        ).fetchone()
+        database = connection.execute(
+            "SELECT pg_database_size(current_database()) AS bytes,"
+            "(SELECT COUNT(*) FROM pg_stat_activity) AS connections"
+        ).fetchone()
+        queue = connection.execute(
+            "SELECT COUNT(*) FILTER(WHERE status='queued') AS queued,COUNT(*) FILTER(WHERE status='running') AS running FROM maintenance_tasks"
+        ).fetchone()
+        worker_age = int((now-worker["last_heartbeat_at"]).total_seconds()) if worker else 999999
+        connection.execute(
+            "INSERT INTO service_health_samples(service,status,metrics,detail) VALUES('postgres','healthy',%s,%s)",
+            (json.dumps({"databaseBytes": database["bytes"], "connections": database["connections"]}), "PostgreSQL 可查詢"),
+        )
+        connection.execute(
+            "INSERT INTO service_health_samples(service,status,metrics,detail) VALUES('maintenance-worker',%s,%s,%s)",
+            ("healthy" if worker_age <= 30 else "critical",
+             json.dumps({"heartbeatAgeSeconds": worker_age, "activeTasks": worker["active_tasks"] if worker else 0,
+                         "queuedTasks": queue["queued"], "runningTasks": queue["running"]}),
+             worker["id"] if worker else "尚無 Worker 心跳"),
+        )
+        try:
+            backup_age = max(0, int(now.timestamp()) - int((BACKUP_STORAGE_PATH / ".worker-heartbeat").read_text().strip()))
+        except (OSError, ValueError):
+            backup_age = 999999
+        connection.execute(
+            "INSERT INTO service_health_samples(service,status,metrics,detail) VALUES('backup-worker',%s,%s,%s)",
+            ("healthy" if backup_age <= 120 else "critical", json.dumps({"heartbeatAgeSeconds": backup_age}), "備份 Worker 心跳"),
+        )
+        rows = connection.execute(
+            """SELECT host_id,COUNT(*) AS samples,
+                      (array_agg(cpu_percent ORDER BY collected_at DESC))[1] AS cpu_current,
+                      (array_agg(ram_percent ORDER BY collected_at DESC))[1] AS ram_current,
+                      (array_agg(disk_percent ORDER BY collected_at DESC))[1] AS disk_current,
+                      COALESCE(regr_slope(cpu_percent::double precision,EXTRACT(EPOCH FROM collected_at))*86400,0) AS cpu_slope,
+                      COALESCE(regr_slope(ram_percent::double precision,EXTRACT(EPOCH FROM collected_at))*86400,0) AS ram_slope,
+                      COALESCE(regr_slope(disk_percent::double precision,EXTRACT(EPOCH FROM collected_at))*86400,0) AS disk_slope
+               FROM host_metric_samples WHERE collected_at >= NOW()-INTERVAL '7 days'
+               GROUP BY host_id"""
+        ).fetchall()
+        rule = connection.execute("SELECT enabled,severity,threshold FROM alert_rules WHERE id='rule-capacity-forecast'").fetchone()
+        threshold_days = float(rule["threshold"]) if rule else 14.0
+        risky_hosts: set[str] = set()
+        for row in rows:
+            confidence = "high" if row["samples"] >= 100 else "medium" if row["samples"] >= 20 else "low"
+            for resource in ("cpu", "ram", "disk"):
+                current, slope = float(row[f"{resource}_current"]), float(row[f"{resource}_slope"])
+                predicted = round((85-current)/slope, 1) if slope > 0.05 and current < 85 else (0.0 if current >= 85 else None)
+                if predicted is not None and predicted <= threshold_days:
+                    risky_hosts.add(row["host_id"])
+                connection.execute(
+                    """INSERT INTO capacity_forecasts(host_id,resource,current_percent,slope_per_day,predicted_days,sample_count,confidence)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(host_id,resource) DO UPDATE SET
+                       current_percent=EXCLUDED.current_percent,slope_per_day=EXCLUDED.slope_per_day,
+                       predicted_days=EXCLUDED.predicted_days,sample_count=EXCLUDED.sample_count,
+                       confidence=EXCLUDED.confidence,calculated_at=NOW()""",
+                    (row["host_id"], resource, current, slope, predicted, row["samples"], confidence),
+                )
+        if rule and rule["enabled"]:
+            for host_id in risky_hosts:
+                connection.execute(
+                    """INSERT INTO alert_events(id,rule_id,host_id,status,severity,message)
+                       VALUES(%s,'rule-capacity-forecast',%s,'firing',%s,%s)
+                       ON CONFLICT DO NOTHING""",
+                    (f"alert-{uuid.uuid4().hex[:20]}", host_id, rule["severity"],
+                     f"依最近 7 天趨勢，資源可能在 {threshold_days:g} 天內達到 85%"),
+                )
+            connection.execute(
+                """UPDATE alert_events SET status='resolved',resolved_at=NOW(),updated_at=NOW()
+                   WHERE rule_id='rule-capacity-forecast' AND status IN ('firing','acknowledged')
+                     AND NOT(host_id=ANY(%s))""",
+                (list(risky_hosts) or ["__none__"],),
+            )
+        connection.execute("DELETE FROM service_health_samples WHERE collected_at < NOW()-INTERVAL '30 days'")
+        connection.execute("DELETE FROM maintenance_workers WHERE last_heartbeat_at < NOW()-INTERVAL '10 minutes'")
+
+
+def read_observability() -> dict[str, Any]:
+    with connect_db() as connection:
+        services = connection.execute(
+            """SELECT DISTINCT ON(service) service,status,metrics,detail,collected_at
+               FROM service_health_samples ORDER BY service,collected_at DESC"""
+        ).fetchall()
+        history = connection.execute(
+            """SELECT service,status,metrics,collected_at FROM service_health_samples
+               WHERE collected_at>=NOW()-INTERVAL '24 hours' ORDER BY collected_at"""
+        ).fetchall()
+        forecasts = connection.execute(
+            """SELECT f.host_id,h.name AS host_name,f.resource,f.current_percent,f.slope_per_day,
+                      f.threshold_percent,f.predicted_days,f.sample_count,f.confidence,f.calculated_at
+               FROM capacity_forecasts f JOIN managed_hosts h ON h.id=f.host_id
+               ORDER BY f.predicted_days ASC NULLS LAST,h.name,f.resource"""
+        ).fetchall()
+        workers = connection.execute(
+            """SELECT id,version,concurrency,active_tasks,last_heartbeat_at,
+                      last_heartbeat_at>NOW()-INTERVAL '30 seconds' AS online
+               FROM maintenance_workers ORDER BY last_heartbeat_at DESC"""
+        ).fetchall()
+    return {
+        "services": [{"service":r["service"],"status":r["status"],"metrics":r["metrics"],"detail":r["detail"],"collectedAt":r["collected_at"].isoformat()} for r in services],
+        "history": [{"service":r["service"],"status":r["status"],"metrics":r["metrics"],"collectedAt":r["collected_at"].isoformat()} for r in history],
+        "forecasts": [{"hostId":r["host_id"],"hostName":r["host_name"],"resource":r["resource"],
+            "currentPercent":float(r["current_percent"]),"slopePerDay":float(r["slope_per_day"]),
+            "thresholdPercent":float(r["threshold_percent"]),"predictedDays":float(r["predicted_days"]) if r["predicted_days"] is not None else None,
+            "sampleCount":r["sample_count"],"confidence":r["confidence"],"calculatedAt":r["calculated_at"].isoformat()} for r in forecasts],
+        "workers": [{"id":r["id"],"version":r["version"],"concurrency":r["concurrency"],"activeTasks":r["active_tasks"],
+            "online":r["online"],"lastHeartbeatAt":r["last_heartbeat_at"].isoformat()} for r in workers],
+    }
+
+
+@app.get("/api/observability")
+async def observability_summary(request: Request, refresh: bool = False) -> dict[str, Any]:
+    require_permission(request, "audit.read")
+    if refresh:
+        await asyncio.to_thread(refresh_observability)
+    return await asyncio.to_thread(read_observability)
+
+
 @app.post("/api/tasks", status_code=201)
 async def create_maintenance_task(payload: MaintenanceTaskCreate, request: Request) -> dict[str, Any]:
     actor = require_permission(request, "tasks.request")
@@ -5427,6 +5552,16 @@ async def retention_cleanup_loop() -> None:
         except (psycopg.Error, KeyError):
             pass
         await asyncio.sleep(24 * 60 * 60)
+
+
+async def observability_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.to_thread(refresh_observability)
+        except (psycopg.Error, OSError, ValueError):
+            pass
+        await asyncio.sleep(300)
 
 
 @app.post("/api/tasks/recover-stuck")
@@ -6676,7 +6811,7 @@ async def run_automation_job(job_type: str, request: Request) -> dict[str, Any]:
 @app.post("/api/alert-rules", status_code=201)
 async def create_alert_rule(payload: AlertRuleCreate, request: Request) -> dict[str, Any]:
     actor = require_permission(request, "alerts.manage")
-    if payload.metric in {"log_collection", "asset_drift", "security_updates", "security_baseline"}:
+    if payload.metric in {"log_collection", "asset_drift", "security_updates", "security_baseline", "capacity_forecast"}:
         raise HTTPException(status_code=409,detail="此監控項目使用系統內建規則，請修改既有規則或對應政策")
     rule_id = f"rule-{uuid.uuid4().hex[:16]}"
     try:
@@ -6729,7 +6864,7 @@ async def update_alert_rule(
             ).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="找不到告警規則")
-            system_metrics = {"rule-log-collection": "log_collection", "rule-asset-drift": "asset_drift", "rule-security-updates": "security_updates", "rule-security-baseline": "security_baseline"}
+            system_metrics = {"rule-log-collection": "log_collection", "rule-asset-drift": "asset_drift", "rule-security-updates": "security_updates", "rule-security-baseline": "security_baseline", "rule-capacity-forecast": "capacity_forecast"}
             if rule_id in system_metrics:
                 if payload.metric != system_metrics[rule_id]:
                     raise HTTPException(status_code=409,detail="系統內建規則不能改成其他監控項目")

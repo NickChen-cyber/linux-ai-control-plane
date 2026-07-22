@@ -33,6 +33,10 @@ def register_worker(active_tasks: int = 0) -> None:
                  last_heartbeat_at=NOW()""",
             (WORKER_ID, APP_VERSION, CONCURRENCY, active_tasks),
         )
+        connection.execute(
+            "DELETE FROM maintenance_workers WHERE id<>%s AND last_heartbeat_at < NOW() - INTERVAL '10 minutes'",
+            (WORKER_ID,),
+        )
 
 
 def claim_task() -> dict[str, Any] | None:
