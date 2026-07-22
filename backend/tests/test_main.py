@@ -313,6 +313,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("維護時段：",source); self.assertIn("NOT EXISTS(SELECT 1 FROM maintenance_windows",source)
         self.assertIn("維護時段管理",ui); self.assertIn("持續採集與保存告警證據",ui)
 
+    def test_alert_inhibition_is_same_host_and_preserves_child_events(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"016_alert_inhibition.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("alert_inhibition_rules",migration); self.assertIn("CHECK(source_rule_id<>target_rule_id)",migration)
+        self.assertIn("src.host_id=target.host_id",source); self.assertIn("相依抑制：",source)
+        self.assertIn("告警相依與抑制",ui); self.assertIn("子告警證據仍保留",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

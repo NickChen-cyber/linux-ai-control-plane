@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.3.0-maintenance-windows.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.4.0-alert-inhibition.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -71,6 +71,10 @@ Schema 應為 `014`。到告警中心的通知交付健康度確認目標、整�
 ## 2.3.0 升級後驗證
 
 Schema 應為 `015`。建立一個未來維護時段應顯示「即將開始」；進入時間範圍後顯示「維護中」，期間告警證據仍會保存但通知與再次提醒依選項暫停。
+
+## 2.4.0 升級後驗證
+
+Schema 應為 `016`。建立「主機離線 → CPU 使用率」相依規則；同一主機離線告警作用時，CPU 子告警仍保存，但通知紀錄應顯示由相依規則抑制且不會再次升級。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

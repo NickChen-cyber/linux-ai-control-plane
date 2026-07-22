@@ -41,6 +41,7 @@ request GET /api/notification-tests | python3 -c 'import json,sys; assert isinst
 request GET /api/notification-routes | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "routes" in d and "channels" in d'
 request GET /api/notification-delivery-health | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "channels" in d'
 request GET /api/maintenance-windows | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["windows"],list)'
+request GET /api/alert-inhibitions | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["inhibitions"],list)'
 host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
 request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 
