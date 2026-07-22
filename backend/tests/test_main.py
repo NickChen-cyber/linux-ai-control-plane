@@ -277,6 +277,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("host_metric_hourly",migration); self.assertIn("host_metric_daily",migration); self.assertIn("host_metric_daily_time_idx",migration)
         self.assertIn("metric_rollup_loop",source); self.assertIn('/metric-trends',source); self.assertIn('90d',ui)
 
+    def test_notification_test_lab_is_isolated_from_alert_events(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"011_notification_test_lab.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("notification_test_runs",migration); self.assertNotIn("REFERENCES alert_events",migration)
+        self.assertIn('/api/notification-tests',source); self.assertIn('evaluate_notification_test',source)
+        self.assertIn("測試資料不會進入正式告警",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

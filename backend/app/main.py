@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.8.0").strip() or "1.8.0"
-MIN_COMPATIBLE_SCHEMA = "010"
+APP_VERSION = os.getenv("APP_VERSION", "1.9.0").strip() or "1.9.0"
+MIN_COMPATIBLE_SCHEMA = "011"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -835,6 +835,14 @@ class AlertSilenceCreate(BaseModel):
 
 class NotificationEscalationUpdate(BaseModel):
     enabled:bool; warning_interval_minutes:int=Field(alias="warningIntervalMinutes",ge=5,le=1440); critical_interval_minutes:int=Field(alias="criticalIntervalMinutes",ge=1,le=1440); max_reminders:int=Field(alias="maxReminders",ge=1,le=20); critical_escalate_after_minutes:int=Field(alias="criticalEscalateAfterMinutes",ge=1,le=10080)
+    model_config={"populate_by_name":True}
+
+class NotificationTestCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=100)
+    severity:str=Field(pattern="^(warning|critical)$")
+    host_id:str|None=Field(default=None,alias="hostId",max_length=100)
+    rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
+    delivery_requested:bool=Field(default=False,alias="deliveryRequested")
     model_config={"populate_by_name":True}
 
 
@@ -4651,6 +4659,69 @@ async def put_notification_escalation(payload:NotificationEscalationUpdate,reque
     actor=require_permission(request,"alerts.manage")
     with connect_db() as connection: connection.execute("UPDATE notification_escalation_policy SET enabled=%s,warning_interval_minutes=%s,critical_interval_minutes=%s,max_reminders=%s,critical_escalate_after_minutes=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.enabled,payload.warning_interval_minutes,payload.critical_interval_minutes,payload.max_reminders,payload.critical_escalate_after_minutes,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"notifications.escalation.update","更新通知升級政策",str(payload.enabled)); return await asyncio.to_thread(read_notification_escalation)
+
+def serialize_notification_test(row:dict[str,Any])->dict[str,Any]:
+    return {"id":row["id"],"name":row["name"],"severity":row["severity"],"hostId":row["host_id"],"ruleId":row["rule_id"],"deliveryRequested":row["delivery_requested"],"status":row["status"],"steps":row["steps"],"result":row["result"],"createdAt":row["created_at"].isoformat()}
+
+def read_notification_tests()->dict[str,Any]:
+    with connect_db() as connection:
+        rows=connection.execute("SELECT * FROM notification_test_runs ORDER BY created_at DESC LIMIT 100").fetchall()
+    return {"runs":[serialize_notification_test(row) for row in rows]}
+
+def evaluate_notification_test(payload:NotificationTestCreate)->tuple[list[dict[str,Any]],dict[str,Any]]:
+    channels=notification_channels(); enabled=[item for item in channels if item["enabled"]]
+    with connect_db() as connection:
+        if payload.host_id and not connection.execute("SELECT 1 FROM managed_hosts WHERE id=%s",(payload.host_id,)).fetchone(): raise HTTPException(status_code=404,detail="主機不存在")
+        if payload.rule_id and not connection.execute("SELECT 1 FROM alert_rules WHERE id=%s",(payload.rule_id,)).fetchone(): raise HTTPException(status_code=404,detail="告警規則不存在")
+        policy=connection.execute("SELECT * FROM notification_governance_policy WHERE id=1").fetchone()
+        escalation=connection.execute("SELECT * FROM notification_escalation_policy WHERE id=1").fetchone()
+        silence=connection.execute("SELECT name,reason FROM alert_silences WHERE starts_at<=NOW() AND ends_at>NOW() AND (host_id IS NULL OR host_id=%s) AND (rule_id IS NULL OR rule_id=%s) ORDER BY created_at DESC LIMIT 1",(payload.host_id,payload.rule_id)).fetchone()
+    hour=datetime.now(timezone.utc).hour; quiet=False
+    if policy and policy["quiet_enabled"] and not(payload.severity=="critical" and policy["critical_bypass"]):
+        start=policy["quiet_start_hour"]; end=policy["quiet_end_hour"]
+        quiet=(start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end
+    suppressed=bool(silence) or quiet
+    reason=f"靜音規則：{silence['name']}" if silence else "全域安靜時段" if quiet else None
+    steps=[
+        {"key":"channels","label":"通知管道","status":"passed" if enabled else "warning","detail":f"{len(enabled)} 個已啟用 / {len(channels)} 個可用"},
+        {"key":"silence","label":"靜音規則","status":"blocked" if silence else "passed","detail":f"命中：{silence['name']}" if silence else "未命中作用中靜音"},
+        {"key":"quiet","label":"安靜時段","status":"blocked" if quiet else "passed","detail":"目前通知會被抑制" if quiet else "目前允許通知"},
+        {"key":"escalation","label":"升級政策","status":"passed" if escalation and escalation["enabled"] else "warning","detail":f"最多 {escalation['max_reminders']} 次提醒" if escalation and escalation["enabled"] else "再次提醒未啟用"},
+    ]
+    return steps,{"suppressed":suppressed,"suppressionReason":reason,"enabledChannels":[{"id":c["id"],"name":c["name"],"destination":c["destination"]} for c in enabled],"deliveryResults":[]}
+
+@app.get("/api/notification-tests")
+async def list_notification_tests(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_tests)
+
+@app.post("/api/notification-tests",status_code=201)
+async def create_notification_test(payload:NotificationTestCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage"); steps,result=await asyncio.to_thread(evaluate_notification_test,payload); status="completed"
+    if payload.delivery_requested and not result["suppressed"]:
+        intent={"eventId":None,"kind":"test","severity":payload.severity,"message":f"🔔 [Linux AI 隔離測試]\n{payload.name}\n等級：{payload.severity}\n時間：{utc_now()}"}
+        deliveries=await dispatch_notifications([intent]); result["deliveryResults"]=deliveries
+        failed=any(item["status"]!="sent" for item in deliveries) or not deliveries
+        steps.append({"key":"delivery","label":"實際發送","status":"failed" if failed else "passed","detail":f"成功 {sum(item['status']=='sent' for item in deliveries)} / {len(deliveries)}"}); status="failed" if failed else status
+    else:
+        detail=f"已抑制：{result['suppressionReason']}" if result["suppressed"] else "僅模擬，未實際發送"
+        steps.append({"key":"delivery","label":"實際發送","status":"blocked" if result["suppressed"] else "skipped","detail":detail})
+    run_id=f"ntt-{uuid.uuid4().hex[:20]}"
+    with connect_db() as connection:
+        row=connection.execute("INSERT INTO notification_test_runs(id,name,severity,host_id,rule_id,delivery_requested,status,steps,result,requested_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s) RETURNING *",(run_id,payload.name,payload.severity,payload.host_id,payload.rule_id,payload.delivery_requested,status,json.dumps(steps,ensure_ascii=False),json.dumps(result,ensure_ascii=False),actor["id"])).fetchone()
+    await asyncio.to_thread(record_backend_audit,request,"notifications.test.create","執行隔離通知測試",payload.name)
+    return {"run":serialize_notification_test(row)}
+
+@app.delete("/api/notification-tests/{run_id}",status_code=204)
+async def delete_notification_test(run_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: row=connection.execute("DELETE FROM notification_test_runs WHERE id=%s RETURNING name",(run_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="測試紀錄不存在")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.test.delete","刪除通知測試紀錄",row["name"]); return Response(status_code=204)
+
+@app.delete("/api/notification-tests",status_code=204)
+async def clear_notification_tests(request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("DELETE FROM notification_test_runs")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.test.clear","清除通知測試紀錄","all"); return Response(status_code=204)
 
 
 @app.post("/api/monitoring/collect")

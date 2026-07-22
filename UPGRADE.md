@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.8.0.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v1.9.0-notification-test-lab.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -51,6 +51,10 @@ Schema 應為 `009`。告警中心應顯示再次提醒政策與歷史；測試�
 ## 1.8.0 升級後驗證
 
 Schema 應為 `010`。等待約 5 分鐘或重新啟動 API 後，告警中心的 7／30／90 天範圍應可查詢彙總資料。
+
+## 1.9.0 升級後驗證
+
+Schema 應為 `011`。到「告警中心 → 通知與治理測試」，先以未勾選實際發送的模式執行，確認通知管道、靜音、安靜時段、升級與發送五個步驟都有結果；測試不會建立正式告警。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

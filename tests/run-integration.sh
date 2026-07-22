@@ -36,10 +36,12 @@ request GET /api/reliability | python3 -c 'import json,sys; d=json.load(sys.stdi
 request GET /api/reports | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "reports" in d and "channels" in d'
 request GET /api/notifications/governance | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "silences" in d'
 request GET /api/notifications/escalation | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "history" in d'
+request GET /api/notification-tests | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["runs"],list)'
 host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
 request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 
 if [ "${INTEGRATION_MUTATIONS:-0}" = 1 ]; then
+  request POST /api/notification-tests '{"name":"integration simulation","severity":"warning","deliveryRequested":false}' | python3 -c 'import json,sys; d=json.load(sys.stdin)["run"]; assert d["status"]=="completed" and d["result"]["deliveryResults"]==[]'
   request POST /api/monitoring/collect | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'
   request POST /api/backups | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] in ("queued","running")'
   request POST /api/retention/preview | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["preview"] is True and "audit_events" in d["result"]'
