@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.3.0").strip() or "3.3.0"
-MIN_COMPATIBLE_SCHEMA = "025"
+APP_VERSION = os.getenv("APP_VERSION", "3.4.0").strip() or "3.4.0"
+MIN_COMPATIBLE_SCHEMA = "026"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -882,6 +882,10 @@ class OnCallHandoffCreate(BaseModel):
 
 class OnCallCoveragePolicyUpdate(BaseModel):
     horizon_hours:int=Field(alias="horizonHours",ge=1,le=720); target_percent:float=Field(alias="targetPercent",ge=1,le=100); alert_enabled:bool|None=Field(default=None,alias="alertEnabled"); alert_lead_hours:int|None=Field(default=None,alias="alertLeadHours",ge=1,le=168)
+    model_config={"populate_by_name":True}
+
+class OnCallTemplateCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=100); user_id:str=Field(alias="userId",max_length=100); first_starts_at:datetime=Field(alias="firstStartsAt"); interval_days:int=Field(alias="intervalDays",ge=1,le=31); duration_minutes:int=Field(alias="durationMinutes",ge=30,le=10080); horizon_days:int=Field(default=30,alias="horizonDays",ge=1,le=180)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -2116,6 +2120,7 @@ async def lifespan(_: FastAPI):
     escalation_task = asyncio.create_task(notification_escalation_loop(), name="notification-escalation-worker")
     ownership_sla_task = asyncio.create_task(alert_ownership_sla_loop(), name="alert-ownership-sla-worker")
     on_call_gap_task = asyncio.create_task(on_call_gap_alert_loop(), name="on-call-gap-alert-worker")
+    recurring_on_call_task = asyncio.create_task(recurring_on_call_loop(), name="recurring-on-call-worker")
     rollup_task = asyncio.create_task(metric_rollup_loop(), name="metric-rollup-worker")
     try:
         yield
@@ -2134,6 +2139,7 @@ async def lifespan(_: FastAPI):
         escalation_task.cancel()
         ownership_sla_task.cancel()
         on_call_gap_task.cancel()
+        recurring_on_call_task.cancel()
         rollup_task.cancel()
         try:
             await asyncio.gather(
@@ -2148,6 +2154,7 @@ async def lifespan(_: FastAPI):
                 escalation_task,
                 ownership_sla_task,
                 on_call_gap_task,
+                recurring_on_call_task,
                 rollup_task,
             )
         except asyncio.CancelledError:
@@ -5006,6 +5013,58 @@ async def on_call_gap_alert_loop()->None:
                 with connect_db() as connection: connection.execute("UPDATE on_call_gap_alerts SET status=%s,delivery_count=%s,detail=%s WHERE id=%s",(status,sum(r["status"]=="sent" for r in results),"值班缺口通知已處理",gap["id"]))
         except Exception as error: print(f"on-call gap alert error: {error}",flush=True)
         await asyncio.sleep(300)
+
+def materialize_on_call_templates()->dict[str,int]:
+    created=0; skipped=0; now=datetime.now(timezone.utc)
+    with connect_db() as connection:
+        templates=connection.execute("SELECT * FROM on_call_templates WHERE enabled=TRUE ORDER BY created_at").fetchall()
+        for template in templates:
+            start=template["first_starts_at"]
+            while start+timedelta(minutes=template["duration_minutes"])<=now: start+=timedelta(days=template["interval_days"])
+            limit=now+timedelta(days=template["horizon_days"])
+            while start<limit:
+                finish=start+timedelta(minutes=template["duration_minutes"])
+                overlap=connection.execute("SELECT 1 FROM on_call_shifts WHERE enabled=TRUE AND starts_at<%s AND ends_at>%s LIMIT 1",(finish,start)).fetchone()
+                if overlap: skipped+=1
+                else:
+                    row=connection.execute("INSERT INTO on_call_shifts(id,user_id,starts_at,ends_at,note,enabled,created_by,template_id) VALUES(%s,%s,%s,%s,%s,TRUE,%s,%s) ON CONFLICT DO NOTHING RETURNING id",(f"shf-{uuid.uuid4().hex[:20]}",template["user_id"],start,finish,f"週期範本：{template['name']}",template["created_by"],template["id"])).fetchone()
+                    if row: created+=1
+                start+=timedelta(days=template["interval_days"])
+    return {"created":created,"skipped":skipped}
+
+def read_on_call_templates()->dict[str,Any]:
+    with connect_db() as connection:
+        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE ORDER BY display_name").fetchall()
+        rows=connection.execute("""SELECT t.*,u.display_name,u.username,(SELECT COUNT(*) FROM on_call_shifts s WHERE s.template_id=t.id AND s.ends_at>NOW()) AS future_shifts FROM on_call_templates t JOIN platform_users u ON u.id=t.user_id ORDER BY t.created_at DESC""").fetchall()
+    return {"users":[{"id":u["id"],"username":u["username"],"displayName":u["display_name"]} for u in users],"templates":[{"id":t["id"],"name":t["name"],"userId":t["user_id"],"displayName":t["display_name"],"username":t["username"],"firstStartsAt":t["first_starts_at"].isoformat(),"intervalDays":t["interval_days"],"durationMinutes":t["duration_minutes"],"horizonDays":t["horizon_days"],"enabled":t["enabled"],"futureShifts":t["future_shifts"]} for t in rows]}
+
+@app.get("/api/on-call-templates")
+async def list_on_call_templates(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_templates)
+
+@app.post("/api/on-call-templates",status_code=201)
+async def create_on_call_template(payload:OnCallTemplateCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection:
+        if not connection.execute("SELECT 1 FROM platform_users WHERE id=%s AND enabled=TRUE",(payload.user_id,)).fetchone(): raise HTTPException(status_code=404,detail="值班使用者不存在或已停用")
+        connection.execute("INSERT INTO on_call_templates(id,name,user_id,first_starts_at,interval_days,duration_minutes,horizon_days,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(f"tpl-{uuid.uuid4().hex[:20]}",payload.name,payload.user_id,payload.first_starts_at,payload.interval_days,payload.duration_minutes,payload.horizon_days,actor["id"]))
+    result=await asyncio.to_thread(materialize_on_call_templates); await asyncio.to_thread(record_backend_audit,request,"on_call.template.create","建立週期值班範本",payload.name); return {**await asyncio.to_thread(read_on_call_templates),"materialized":result}
+
+@app.post("/api/on-call-templates/materialize")
+async def materialize_on_call(request:Request)->dict[str,Any]: require_permission(request,"alerts.manage"); result=await asyncio.to_thread(materialize_on_call_templates); return {**await asyncio.to_thread(read_on_call_templates),"materialized":result}
+
+@app.delete("/api/on-call-templates/{template_id}",status_code=204)
+async def delete_on_call_template(template_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection:
+        connection.execute("DELETE FROM on_call_shifts WHERE template_id=%s AND starts_at>NOW()",(template_id,)); row=connection.execute("DELETE FROM on_call_templates WHERE id=%s RETURNING name",(template_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="週期範本不存在")
+    await asyncio.to_thread(record_backend_audit,request,"on_call.template.delete","刪除週期值班範本",row["name"]); return Response(status_code=204)
+
+async def recurring_on_call_loop()->None:
+    while True:
+        try: await asyncio.to_thread(materialize_on_call_templates)
+        except Exception as error: print(f"recurring on-call error: {error}",flush=True)
+        await asyncio.sleep(3600)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:

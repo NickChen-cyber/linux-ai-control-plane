@@ -46,6 +46,7 @@ request GET /api/alert-correlations | python3 -c 'import json,sys; assert isinst
 request GET /api/alert-storms | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "storms" in d'
 request GET /api/on-call | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "shifts" in d and "assignments" in d'
 request GET /api/on-call-handoffs | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "shifts" in d and "history" in d'
+request GET /api/on-call-templates | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "templates" in d'
 request GET /api/on-call-coverage | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "gaps" in d and "history" in d'
 request GET /api/alert-ownership | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "events" in d and "workload" in d and "history" in d'
 request GET /api/alert-ownership-sla | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "events" in d and "history" in d'

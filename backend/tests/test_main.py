@@ -383,6 +383,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("on_call_gap_alert_loop",source); self.assertIn("ON CONFLICT(fingerprint) DO NOTHING",source); self.assertIn("status='resolved'",source)
         self.assertIn("值班缺口自動通知",ui); self.assertIn("啟用值班缺口通知",ui)
 
+    def test_recurring_on_call_materializes_without_overlap(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"026_recurring_on_call.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_templates",migration); self.assertIn("on_call_shifts_template_start_idx",migration); self.assertIn("interval_days",migration)
+        self.assertIn("materialize_on_call_templates",source); self.assertIn("starts_at<%s AND ends_at>%s",source); self.assertIn("recurring_on_call_loop",source)
+        self.assertIn("週期值班範本",ui); self.assertIn("建立並展開",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
