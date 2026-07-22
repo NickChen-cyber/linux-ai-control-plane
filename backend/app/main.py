@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.7.1").strip() or "2.7.1"
-MIN_COMPATIBLE_SCHEMA = "019"
+APP_VERSION = os.getenv("APP_VERSION", "2.8.0").strip() or "2.8.0"
+MIN_COMPATIBLE_SCHEMA = "020"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -874,6 +874,10 @@ class AlertStormPolicyUpdate(BaseModel):
 
 class OnCallShiftCreate(BaseModel):
     user_id:str=Field(alias="userId",max_length=100); starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); note:str=Field(default="",max_length=500); enabled:bool=True
+    model_config={"populate_by_name":True}
+
+class AlertOwnershipUpdate(BaseModel):
+    user_id:str|None=Field(default=None,alias="userId",max_length=100); note:str=Field(default="",max_length=500)
     model_config={"populate_by_name":True}
 
 
@@ -3949,11 +3953,12 @@ def assign_alert_to_on_call(intent:dict[str,Any])->dict[str,Any]|None:
     with connect_db() as connection:
         event=connection.execute("SELECT id,assignee_id FROM alert_events WHERE id=%s",(intent["eventId"],)).fetchone()
         if not event or event["assignee_id"]: return None
+        if connection.execute("SELECT 1 FROM alert_assignments WHERE alert_event_id=%s LIMIT 1",(event["id"],)).fetchone(): return None
         shift=connection.execute("SELECT s.id,s.user_id,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND s.starts_at<=NOW() AND s.ends_at>NOW() ORDER BY s.starts_at DESC LIMIT 1").fetchone()
         if not shift: return None
         row=connection.execute("UPDATE alert_events SET assignee_id=%s,updated_at=NOW() WHERE id=%s AND assignee_id IS NULL RETURNING id",(shift["user_id"],event["id"])).fetchone()
         if not row: return None
-        connection.execute("INSERT INTO alert_assignments(id,alert_event_id,user_id,shift_id) VALUES(%s,%s,%s,%s) ON CONFLICT(alert_event_id) DO NOTHING",(f"asn-{uuid.uuid4().hex[:20]}",event["id"],shift["user_id"],shift["id"])); return {"userId":shift["user_id"],"displayName":shift["display_name"],"shiftId":shift["id"]}
+        connection.execute("INSERT INTO alert_assignments(id,alert_event_id,user_id,shift_id) VALUES(%s,%s,%s,%s)",(f"asn-{uuid.uuid4().hex[:20]}",event["id"],shift["user_id"],shift["id"])); return {"userId":shift["user_id"],"displayName":shift["display_name"],"shiftId":shift["id"]}
 
 
 async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4905,6 +4910,33 @@ async def delete_on_call_shift(shift_id:str,request:Request)->Response:
     with connect_db() as connection: row=connection.execute("DELETE FROM on_call_shifts WHERE id=%s RETURNING id",(shift_id,)).fetchone()
     if not row: raise HTTPException(status_code=404,detail="值班時段不存在")
     await asyncio.to_thread(record_backend_audit,request,"on_call.shift.delete","刪除值班時段",shift_id); return Response(status_code=204)
+
+def read_alert_ownership()->dict[str,Any]:
+    with connect_db() as connection:
+        users=connection.execute("SELECT id,username,display_name FROM platform_users WHERE enabled=TRUE ORDER BY display_name").fetchall()
+        events=connection.execute("""SELECT e.id,e.severity,e.message,e.status,e.started_at,e.assignee_id,u.display_name AS assignee_name,h.name AS host_name,r.name AS rule_name FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id LEFT JOIN platform_users u ON u.id=e.assignee_id WHERE e.status IN ('firing','acknowledged') ORDER BY e.assignee_id NULLS FIRST,e.started_at""").fetchall()
+        history=connection.execute("""SELECT a.id,a.alert_event_id,a.action,a.note,a.assigned_at,new_user.display_name AS user_name,old_user.display_name AS previous_user_name,actor.display_name AS actor_name FROM alert_assignments a LEFT JOIN platform_users new_user ON new_user.id=a.user_id LEFT JOIN platform_users old_user ON old_user.id=a.previous_user_id LEFT JOIN platform_users actor ON actor.id=a.actor_id ORDER BY a.assigned_at DESC LIMIT 100""").fetchall()
+    workload=[]
+    for user in users:
+        assigned=sum(1 for event in events if event["assignee_id"]==user["id"]); workload.append({"userId":user["id"],"displayName":user["display_name"],"count":assigned})
+    return {"users":[{"id":u["id"],"username":u["username"],"displayName":u["display_name"]} for u in users],"events":[{"id":e["id"],"severity":e["severity"],"message":e["message"],"status":e["status"],"hostName":e["host_name"],"ruleName":e["rule_name"],"assigneeId":e["assignee_id"],"assigneeName":e["assignee_name"],"startedAt":e["started_at"].isoformat()} for e in events],"workload":workload,"history":[{"id":h["id"],"alertEventId":h["alert_event_id"],"action":h["action"],"note":h["note"],"userName":h["user_name"],"previousUserName":h["previous_user_name"],"actorName":h["actor_name"],"assignedAt":h["assigned_at"].isoformat()} for h in history]}
+
+@app.get("/api/alert-ownership")
+async def list_alert_ownership(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_ownership)
+
+@app.post("/api/alert-ownership/{event_id}")
+async def update_alert_ownership(event_id:str,payload:AlertOwnershipUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection:
+        event=connection.execute("SELECT assignee_id FROM alert_events WHERE id=%s AND status IN ('firing','acknowledged')",(event_id,)).fetchone()
+        if not event: raise HTTPException(status_code=404,detail="作用中告警不存在")
+        if payload.user_id:
+            user=connection.execute("SELECT 1 FROM platform_users WHERE id=%s AND enabled=TRUE",(payload.user_id,)).fetchone()
+            if not user: raise HTTPException(status_code=404,detail="負責人不存在或已停用")
+        previous=event["assignee_id"]; action="unassign" if payload.user_id is None else "assign" if previous is None else "reassign"
+        connection.execute("UPDATE alert_events SET assignee_id=%s,updated_at=NOW() WHERE id=%s",(payload.user_id,event_id))
+        connection.execute("INSERT INTO alert_assignments(id,alert_event_id,user_id,previous_user_id,assignment_type,action,note,actor_id) VALUES(%s,%s,%s,%s,'manual',%s,%s,%s)",(f"asn-{uuid.uuid4().hex[:20]}",event_id,payload.user_id,previous,action,payload.note or None,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"alerts.ownership.update","更新告警負責人",event_id); return await asyncio.to_thread(read_alert_ownership)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:

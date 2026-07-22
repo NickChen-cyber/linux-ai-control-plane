@@ -343,6 +343,14 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("u.enabled=TRUE",section); self.assertNotIn("locked",section)
         self.assertIn("伺服器錯誤（HTTP",ui)
 
+    def test_alert_ownership_supports_reassignment_and_preserves_history(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"020_alert_ownership.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("DROP CONSTRAINT IF EXISTS alert_assignments_alert_event_id_key",migration)
+        self.assertIn("ON DELETE SET NULL",migration); self.assertIn("previous_user_id",migration); self.assertIn("alert_assignments_event_idx",migration)
+        self.assertIn('/api/alert-ownership/{event_id}',source); self.assertIn('action="unassign"',source); self.assertIn("previous_user_id",source)
+        self.assertIn("SELECT 1 FROM alert_assignments WHERE alert_event_id=%s LIMIT 1",source)
+        self.assertIn("告警負責人工作佇列",ui); self.assertIn("解除指派",ui); self.assertIn("異動備註",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

@@ -1,0 +1,10 @@
+DELETE FROM alert_assignments WHERE user_id IS NULL;
+DELETE FROM alert_assignments a USING alert_assignments b WHERE a.alert_event_id=b.alert_event_id AND (a.assigned_at,a.id)<(b.assigned_at,b.id);
+ALTER TABLE alert_assignments DROP COLUMN IF EXISTS actor_id;
+ALTER TABLE alert_assignments DROP COLUMN IF EXISTS note;
+ALTER TABLE alert_assignments DROP COLUMN IF EXISTS action;
+ALTER TABLE alert_assignments DROP COLUMN IF EXISTS previous_user_id;
+ALTER TABLE alert_assignments DROP CONSTRAINT IF EXISTS alert_assignments_user_id_fkey;
+ALTER TABLE alert_assignments ALTER COLUMN user_id SET NOT NULL;
+ALTER TABLE alert_assignments ADD CONSTRAINT alert_assignments_user_id_fkey FOREIGN KEY(user_id) REFERENCES platform_users(id) ON DELETE CASCADE;
+ALTER TABLE alert_assignments ADD CONSTRAINT alert_assignments_alert_event_id_key UNIQUE(alert_event_id);
