@@ -37,6 +37,7 @@ request GET /api/reports | python3 -c 'import json,sys; d=json.load(sys.stdin); 
 request GET /api/notifications/governance | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "silences" in d'
 request GET /api/notifications/escalation | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "history" in d'
 request GET /api/notification-tests | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["runs"],list)'
+request GET /api/notification-routes | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "routes" in d and "channels" in d'
 host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
 request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 

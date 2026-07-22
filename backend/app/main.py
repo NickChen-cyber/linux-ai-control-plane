@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.9.2").strip() or "1.9.2"
-MIN_COMPATIBLE_SCHEMA = "011"
+APP_VERSION = os.getenv("APP_VERSION", "2.0.0").strip() or "2.0.0"
+MIN_COMPATIBLE_SCHEMA = "012"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -843,6 +843,12 @@ class NotificationTestCreate(BaseModel):
     host_id:str|None=Field(default=None,alias="hostId",max_length=100)
     rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
     delivery_requested:bool=Field(default=False,alias="deliveryRequested")
+    model_config={"populate_by_name":True}
+
+class NotificationRouteCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=100); enabled:bool=True; priority:int=Field(ge=1,le=9999)
+    severity:str|None=Field(default=None,pattern="^(warning|critical)$"); host_id:str|None=Field(default=None,alias="hostId",max_length=100); rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
+    channels:list[str]=Field(min_length=1,max_length=5); title_template:str=Field(alias="titleTemplate",min_length=2,max_length=200); body_template:str=Field(alias="bodyTemplate",min_length=2,max_length=2000)
     model_config={"populate_by_name":True}
 
 
@@ -3685,6 +3691,25 @@ def notification_channels() -> list[dict[str, Any]]:
         },
     ]
 
+def render_notification_template(template:str,context:dict[str,str])->str:
+    result=template
+    for key,value in context.items(): result=result.replace("{{"+key+"}}",value)
+    return result
+
+def resolve_notification_route(intent:dict[str,Any],enabled_channels:list[str])->tuple[list[str],dict[str,Any]|None,dict[str,str]]:
+    if intent.get("kind") not in {"firing","resolved","test"}: return enabled_channels,None,{"title":"","message":intent["message"]}
+    host_id=intent.get("hostId"); rule_id=intent.get("ruleId"); host_name=intent.get("hostName","全部主機"); rule_name=intent.get("ruleName","全部規則")
+    with connect_db() as connection:
+        if intent.get("eventId"):
+            scope=connection.execute("SELECT e.host_id,e.rule_id,h.name AS host_name,r.name AS rule_name FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id WHERE e.id=%s",(intent["eventId"],)).fetchone()
+            if scope: host_id=scope["host_id"]; rule_id=scope["rule_id"]; host_name=scope["host_name"]; rule_name=scope["rule_name"]
+        route=connection.execute("SELECT * FROM notification_routes WHERE enabled=TRUE AND (severity IS NULL OR severity=%s) AND (host_id IS NULL OR host_id=%s) AND (rule_id IS NULL OR rule_id=%s) ORDER BY priority LIMIT 1",(intent["severity"],host_id,rule_id)).fetchone()
+    context={"severity":intent["severity"],"host":host_name,"rule":rule_name,"message":intent["message"],"kind":intent["kind"]}
+    if not route: return enabled_channels,None,{"title":"","message":intent["message"]}
+    selected=[channel for channel in route["channels"] if channel in enabled_channels]
+    title=render_notification_template(route["title_template"],context); body=render_notification_template(route["body_template"],context)
+    return selected,route,{"title":title,"message":f"{title}\n{body}"}
+
 
 def write_notification_delivery(
     channel: str,
@@ -3888,6 +3913,8 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
     pairs: list[tuple[str, dict[str, Any]]] = []
     for intent in intents:
         intent.setdefault("retryKey", str(uuid.uuid4()))
+        selected,route,rendered=await asyncio.to_thread(resolve_notification_route,intent,enabled)
+        intent["message"]=rendered["message"]; intent["routeId"]=route["id"] if route else None
         suppressed=False; reason=""
         if intent.get("kind") not in {"test"}:
             with connect_db() as connection:
@@ -3900,9 +3927,9 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
                     hour=datetime.now(timezone.utc).hour; start=policy["quiet_start_hour"]; end=policy["quiet_end_hour"]
                     if (start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end: suppressed=True; reason="全域安靜時段"
         if suppressed:
-            for channel in enabled: await asyncio.to_thread(write_notification_delivery,channel,intent,"suppressed",next(c["destination"] for c in notification_channels() if c["id"]==channel),reason)
+            for channel in selected: await asyncio.to_thread(write_notification_delivery,channel,intent,"suppressed",next(c["destination"] for c in notification_channels() if c["id"]==channel),reason)
             continue
-        pairs.extend((channel, intent) for channel in enabled)
+        pairs.extend((channel, intent) for channel in selected)
     results = await asyncio.gather(
         *(asyncio.to_thread(send_notification, channel, intent) for channel, intent in pairs)
     )
@@ -4668,6 +4695,47 @@ def read_notification_tests()->dict[str,Any]:
         rows=connection.execute("SELECT * FROM notification_test_runs ORDER BY created_at DESC LIMIT 100").fetchall()
     return {"runs":[serialize_notification_test(row) for row in rows]}
 
+def serialize_notification_route(row:dict[str,Any])->dict[str,Any]:
+    return {"id":row["id"],"name":row["name"],"enabled":row["enabled"],"priority":row["priority"],"severity":row["severity"],"hostId":row["host_id"],"ruleId":row["rule_id"],"channels":row["channels"],"titleTemplate":row["title_template"],"bodyTemplate":row["body_template"],"updatedAt":row["updated_at"].isoformat()}
+
+def read_notification_routes()->dict[str,Any]:
+    with connect_db() as connection: rows=connection.execute("SELECT * FROM notification_routes ORDER BY priority").fetchall()
+    return {"routes":[serialize_notification_route(row) for row in rows],"channels":notification_channels(),"fallback":"沒有符合規則時使用所有已啟用管道"}
+
+def validate_notification_route(payload:NotificationRouteCreate)->None:
+    allowed={channel["id"] for channel in notification_channels()}
+    if any(channel not in allowed for channel in payload.channels): raise HTTPException(status_code=422,detail="包含不支援的通知管道")
+    with connect_db() as connection:
+        if payload.host_id and not connection.execute("SELECT 1 FROM managed_hosts WHERE id=%s",(payload.host_id,)).fetchone(): raise HTTPException(status_code=404,detail="主機不存在")
+        if payload.rule_id and not connection.execute("SELECT 1 FROM alert_rules WHERE id=%s",(payload.rule_id,)).fetchone(): raise HTTPException(status_code=404,detail="告警規則不存在")
+
+@app.get("/api/notification-routes")
+async def list_notification_routes(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_routes)
+
+@app.post("/api/notification-routes",status_code=201)
+async def create_notification_route(payload:NotificationRouteCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage"); await asyncio.to_thread(validate_notification_route,payload); route_id=f"ntr-{uuid.uuid4().hex[:20]}"
+    try:
+        with connect_db() as connection: connection.execute("INSERT INTO notification_routes(id,name,enabled,priority,severity,host_id,rule_id,channels,title_template,body_template,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)",(route_id,payload.name,payload.enabled,payload.priority,payload.severity,payload.host_id,payload.rule_id,json.dumps(payload.channels),payload.title_template,payload.body_template,actor["id"]))
+    except psycopg.errors.UniqueViolation: raise HTTPException(status_code=409,detail="路由優先順序不可重複") from None
+    await asyncio.to_thread(record_backend_audit,request,"notifications.route.create","建立通知路由",payload.name); return await asyncio.to_thread(read_notification_routes)
+
+@app.put("/api/notification-routes/{route_id}")
+async def update_notification_route(route_id:str,payload:NotificationRouteCreate,request:Request)->dict[str,Any]:
+    require_permission(request,"alerts.manage"); await asyncio.to_thread(validate_notification_route,payload)
+    try:
+        with connect_db() as connection: row=connection.execute("UPDATE notification_routes SET name=%s,enabled=%s,priority=%s,severity=%s,host_id=%s,rule_id=%s,channels=%s::jsonb,title_template=%s,body_template=%s,updated_at=NOW() WHERE id=%s RETURNING id",(payload.name,payload.enabled,payload.priority,payload.severity,payload.host_id,payload.rule_id,json.dumps(payload.channels),payload.title_template,payload.body_template,route_id)).fetchone()
+    except psycopg.errors.UniqueViolation: raise HTTPException(status_code=409,detail="路由優先順序不可重複") from None
+    if not row: raise HTTPException(status_code=404,detail="通知路由不存在")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.route.update","修改通知路由",payload.name); return await asyncio.to_thread(read_notification_routes)
+
+@app.delete("/api/notification-routes/{route_id}",status_code=204)
+async def delete_notification_route(route_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: row=connection.execute("DELETE FROM notification_routes WHERE id=%s RETURNING name",(route_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="通知路由不存在")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.route.delete","刪除通知路由",row["name"]); return Response(status_code=204)
+
 def evaluate_notification_test(payload:NotificationTestCreate)->tuple[list[dict[str,Any]],dict[str,Any]]:
     channels=notification_channels(); enabled=[item for item in channels if item["enabled"]]
     with connect_db() as connection:
@@ -4682,13 +4750,15 @@ def evaluate_notification_test(payload:NotificationTestCreate)->tuple[list[dict[
         quiet=(start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end
     suppressed=bool(silence) or quiet
     reason=f"靜音規則：{silence['name']}" if silence else "全域安靜時段" if quiet else None
+    selected,route,_=resolve_notification_route({"kind":"test","severity":payload.severity,"message":payload.name,"hostId":payload.host_id,"ruleId":payload.rule_id},[item["id"] for item in enabled])
     steps=[
         {"key":"channels","label":"通知管道","status":"passed" if enabled else "warning","detail":f"{len(enabled)} 個已啟用 / {len(channels)} 個可用"},
+        {"key":"routing","label":"路由規則","status":"passed","detail":f"{route['name']} → {len(selected)} 個管道" if route else "預設備援：所有已啟用管道"},
         {"key":"silence","label":"靜音規則","status":"blocked" if silence else "passed","detail":f"命中：{silence['name']}" if silence else "未命中作用中靜音"},
         {"key":"quiet","label":"安靜時段","status":"blocked" if quiet else "passed","detail":"目前通知會被抑制" if quiet else "目前允許通知"},
         {"key":"escalation","label":"升級政策","status":"passed" if escalation and escalation["enabled"] else "warning","detail":f"最多 {escalation['max_reminders']} 次提醒" if escalation and escalation["enabled"] else "再次提醒未啟用"},
     ]
-    return steps,{"suppressed":suppressed,"suppressionReason":reason,"enabledChannels":[{"id":c["id"],"name":c["name"],"destination":c["destination"]} for c in enabled],"deliveryResults":[]}
+    return steps,{"suppressed":suppressed,"suppressionReason":reason,"matchedRoute":{"id":route["id"],"name":route["name"]} if route else None,"enabledChannels":[{"id":c["id"],"name":c["name"],"destination":c["destination"]} for c in enabled if c["id"] in selected],"deliveryResults":[]}
 
 @app.get("/api/notification-tests")
 async def list_notification_tests(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_tests)
@@ -4697,7 +4767,7 @@ async def list_notification_tests(request:Request)->dict[str,Any]: require_permi
 async def create_notification_test(payload:NotificationTestCreate,request:Request)->dict[str,Any]:
     actor=require_permission(request,"alerts.manage"); steps,result=await asyncio.to_thread(evaluate_notification_test,payload); status="completed"
     if payload.delivery_requested and not result["suppressed"]:
-        intent={"eventId":None,"kind":"test","severity":payload.severity,"message":f"🔔 [Linux AI 隔離測試]\n{payload.name}\n等級：{payload.severity}\n時間：{utc_now()}"}
+        intent={"eventId":None,"kind":"test","severity":payload.severity,"hostId":payload.host_id,"ruleId":payload.rule_id,"message":f"🔔 [Linux AI 隔離測試]\n{payload.name}\n等級：{payload.severity}\n時間：{utc_now()}"}
         deliveries=await dispatch_notifications([intent]); result["deliveryResults"]=deliveries
         failed=any(item["status"]!="sent" for item in deliveries) or not deliveries
         steps.append({"key":"delivery","label":"實際發送","status":"failed" if failed else "passed","detail":f"成功 {sum(item['status']=='sent' for item in deliveries)} / {len(deliveries)}"}); status="failed" if failed else status

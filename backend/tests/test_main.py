@@ -289,6 +289,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertNotIn('snapshot="$project_dir/../',script)
         self.assertIn("--exclude='./release-snapshots'",script)
 
+    def test_notification_routes_are_prioritized_and_have_fallback(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"012_notification_routing.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("notification_routes",migration); self.assertIn("UNIQUE(priority)",migration)
+        self.assertIn("resolve_notification_route",source); self.assertIn("ORDER BY priority LIMIT 1",source)
+        self.assertIn("告警通知路由",ui); self.assertIn("預設備援路由",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
