@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.4.0").strip() or "2.4.0"
-MIN_COMPATIBLE_SCHEMA = "016"
+APP_VERSION = os.getenv("APP_VERSION", "2.5.0").strip() or "2.5.0"
+MIN_COMPATIBLE_SCHEMA = "017"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -3925,7 +3925,7 @@ async def notification_retry_loop() -> None:
 
 async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     enabled = [channel["id"] for channel in notification_channels() if channel["enabled"]]
-    if not intents or not enabled:
+    if not intents:
         return []
     pairs: list[tuple[str, dict[str, Any]]] = []
     for intent in intents:
@@ -3942,7 +3942,9 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
                 if intent.get("eventId"):
                     silence=connection.execute("""SELECT s.name FROM alert_silences s JOIN alert_events e ON e.id=%s WHERE s.starts_at<=NOW() AND s.ends_at>NOW() AND (s.host_id IS NULL OR s.host_id=e.host_id) AND (s.rule_id IS NULL OR s.rule_id=e.rule_id) ORDER BY s.created_at DESC LIMIT 1""",(intent["eventId"],)).fetchone()
                     maintenance=connection.execute("""SELECT m.name FROM maintenance_windows m JOIN alert_events e ON e.id=%s WHERE m.suppress_notifications=TRUE AND m.starts_at<=NOW() AND m.ends_at>NOW() AND (m.host_id IS NULL OR m.host_id=e.host_id) AND (m.rule_id IS NULL OR m.rule_id=e.rule_id) ORDER BY m.created_at DESC LIMIT 1""",(intent["eventId"],)).fetchone()
-                    inhibition=connection.execute("""SELECT i.name,src.message AS source_message FROM alert_events target JOIN alert_inhibition_rules i ON i.target_rule_id=target.rule_id AND i.enabled=TRUE JOIN alert_events src ON src.rule_id=i.source_rule_id AND src.host_id=target.host_id AND src.status IN ('firing','acknowledged') WHERE target.id=%s LIMIT 1""",(intent["eventId"],)).fetchone()
+                    inhibition=connection.execute("""SELECT i.id,i.name,src.id AS root_event_id,target.id AS child_event_id,src.message AS source_message FROM alert_events target JOIN alert_inhibition_rules i ON i.target_rule_id=target.rule_id AND i.enabled=TRUE JOIN alert_events src ON src.rule_id=i.source_rule_id AND src.host_id=target.host_id AND src.status IN ('firing','acknowledged') WHERE target.id=%s LIMIT 1""",(intent["eventId"],)).fetchone()
+                    if inhibition:
+                        connection.execute("""INSERT INTO alert_correlations(id,inhibition_rule_id,root_event_id,child_event_id) VALUES(%s,%s,%s,%s) ON CONFLICT(root_event_id,child_event_id) DO UPDATE SET status='active',last_seen_at=NOW(),released_at=NULL""",(f"cor-{uuid.uuid4().hex[:20]}",inhibition["id"],inhibition["root_event_id"],inhibition["child_event_id"]))
                 if inhibition: suppressed=True; reason=f"相依抑制：{inhibition['name']}"
                 elif maintenance: suppressed=True; reason=f"維護時段：{maintenance['name']}"
                 elif silence: suppressed=True; reason=f"靜音規則：{silence['name']}"
@@ -4811,6 +4813,15 @@ async def delete_alert_inhibition(inhibition_id:str,request:Request)->Response:
     with connect_db() as connection: row=connection.execute("DELETE FROM alert_inhibition_rules WHERE id=%s RETURNING name",(inhibition_id,)).fetchone()
     if not row: raise HTTPException(status_code=404,detail="抑制規則不存在")
     await asyncio.to_thread(record_backend_audit,request,"alerts.inhibition.delete","刪除告警相依抑制",row["name"]); return Response(status_code=204)
+
+def read_alert_correlations()->dict[str,Any]:
+    with connect_db() as connection:
+        connection.execute("""UPDATE alert_correlations c SET status='released',released_at=COALESCE(released_at,NOW()),last_seen_at=NOW() FROM alert_events root,alert_events child WHERE c.root_event_id=root.id AND c.child_event_id=child.id AND c.status='active' AND (root.status NOT IN ('firing','acknowledged') OR child.status NOT IN ('firing','acknowledged'))""")
+        rows=connection.execute("""SELECT c.*,i.name AS inhibition_name,h.name AS host_name,root.message AS root_message,rr.name AS root_rule_name,child.message AS child_message,cr.name AS child_rule_name FROM alert_correlations c JOIN alert_inhibition_rules i ON i.id=c.inhibition_rule_id JOIN alert_events root ON root.id=c.root_event_id JOIN alert_rules rr ON rr.id=root.rule_id JOIN alert_events child ON child.id=c.child_event_id JOIN alert_rules cr ON cr.id=child.rule_id JOIN managed_hosts h ON h.id=root.host_id ORDER BY CASE WHEN c.status='active' THEN 0 ELSE 1 END,c.last_seen_at DESC LIMIT 100""").fetchall()
+    return {"correlations":[{"id":r["id"],"inhibitionName":r["inhibition_name"],"hostName":r["host_name"],"rootEventId":r["root_event_id"],"rootRuleName":r["root_rule_name"],"rootMessage":r["root_message"],"childEventId":r["child_event_id"],"childRuleName":r["child_rule_name"],"childMessage":r["child_message"],"status":r["status"],"firstSeenAt":r["first_seen_at"].isoformat(),"lastSeenAt":r["last_seen_at"].isoformat(),"releasedAt":r["released_at"].isoformat() if r["released_at"] else None} for r in rows]}
+
+@app.get("/api/alert-correlations")
+async def list_alert_correlations(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_correlations)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:

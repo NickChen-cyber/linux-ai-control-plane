@@ -319,6 +319,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("src.host_id=target.host_id",source); self.assertIn("相依抑制：",source)
         self.assertIn("告警相依與抑制",ui); self.assertIn("子告警證據仍保留",ui)
 
+    def test_root_cause_correlations_persist_and_release(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"017_alert_correlations.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("alert_correlations",migration); self.assertIn("UNIQUE(root_event_id,child_event_id)",migration)
+        self.assertIn("ON CONFLICT(root_event_id,child_event_id)",source); self.assertIn("status='released'",source)
+        self.assertIn("根因關聯視圖",ui); self.assertIn("作用中關聯",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
