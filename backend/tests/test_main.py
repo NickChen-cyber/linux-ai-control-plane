@@ -325,6 +325,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("ON CONFLICT(root_event_id,child_event_id)",source); self.assertIn("status='released'",source)
         self.assertIn("根因關聯視圖",ui); self.assertIn("作用中關聯",ui)
 
+    def test_alert_storm_protection_sends_one_summary_then_suppresses(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"018_alert_storms.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("alert_storm_policy",migration); self.assertIn("alert_storms",migration)
+        self.assertIn("evaluate_alert_storm",source); self.assertIn("告警風暴摘要",source); self.assertIn("告警風暴保護：",source)
+        self.assertIn("告警風暴保護",ui); self.assertIn("冷卻時間",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

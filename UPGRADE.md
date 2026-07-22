@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.5.0-root-cause-correlations.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v2.6.0-alert-storm-protection.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -79,6 +79,10 @@ Schema 應為 `016`。建立「主機離線 → CPU 使用率」相依規則；�
 ## 2.5.0 升級後驗證
 
 Schema 應為 `017`。相依抑制實際命中後，「根因關聯視圖」應顯示根因與子告警；根因或子告警恢復後狀態會改為「已解除」，紀錄不會消失。
+
+## 2.6.0 升級後驗證
+
+Schema 應為 `018`。告警中心應顯示預設 5 分鐘／5 事件／15 分鐘冷卻政策；一般環境沒有風暴時顯示「尚無告警風暴」是正常狀態。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

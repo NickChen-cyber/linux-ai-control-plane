@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.5.0").strip() or "2.5.0"
-MIN_COMPATIBLE_SCHEMA = "017"
+APP_VERSION = os.getenv("APP_VERSION", "2.6.0").strip() or "2.6.0"
+MIN_COMPATIBLE_SCHEMA = "018"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -866,6 +866,10 @@ class MaintenanceWindowCreate(BaseModel):
 
 class AlertInhibitionCreate(BaseModel):
     name:str=Field(min_length=2,max_length=100); source_rule_id:str=Field(alias="sourceRuleId",max_length=100); target_rule_id:str=Field(alias="targetRuleId",max_length=100); reason:str=Field(min_length=2,max_length=500); enabled:bool=True
+    model_config={"populate_by_name":True}
+
+class AlertStormPolicyUpdate(BaseModel):
+    enabled:bool; window_minutes:int=Field(alias="windowMinutes",ge=1,le=60); event_threshold:int=Field(alias="eventThreshold",ge=2,le=100); cooldown_minutes:int=Field(alias="cooldownMinutes",ge=1,le=240)
     model_config={"populate_by_name":True}
 
 
@@ -3922,6 +3926,20 @@ async def notification_retry_loop() -> None:
             pass
         await asyncio.sleep(15)
 
+def evaluate_alert_storm(intent:dict[str,Any])->dict[str,Any]|None:
+    if intent.get("kind")!="firing" or not intent.get("eventId") or str(intent.get("retryKey","")).startswith("escalation:"): return None
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM alert_storm_policy WHERE id=1").fetchone()
+        if not policy or not policy["enabled"]: return None
+        event=connection.execute("SELECT host_id FROM alert_events WHERE id=%s",(intent["eventId"],)).fetchone()
+        if not event: return None
+        count=connection.execute("SELECT COUNT(*) AS count FROM alert_events WHERE host_id=%s AND started_at>=NOW()-(%s*INTERVAL '1 minute')",(event["host_id"],policy["window_minutes"])).fetchone()["count"]
+        if count<policy["event_threshold"]: return None
+        storm=connection.execute("SELECT * FROM alert_storms WHERE host_id=%s AND status='active' AND last_event_at>=NOW()-(%s*INTERVAL '1 minute') ORDER BY started_at DESC LIMIT 1",(event["host_id"],policy["cooldown_minutes"])).fetchone()
+        if storm:
+            connection.execute("UPDATE alert_storms SET event_count=GREATEST(event_count,%s),last_event_at=NOW() WHERE id=%s",(count,storm["id"])); return {"action":"suppress","id":storm["id"],"count":count}
+        storm_id=f"stm-{uuid.uuid4().hex[:20]}"; connection.execute("INSERT INTO alert_storms(id,host_id,status,event_count,summary_sent_at) VALUES(%s,%s,'active',%s,NOW())",(storm_id,event["host_id"],count)); return {"action":"summary","id":storm_id,"count":count}
+
 
 async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     enabled = [channel["id"] for channel in notification_channels() if channel["enabled"]]
@@ -3930,6 +3948,8 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
     pairs: list[tuple[str, dict[str, Any]]] = []
     for intent in intents:
         intent.setdefault("retryKey", str(uuid.uuid4()))
+        storm=await asyncio.to_thread(evaluate_alert_storm,intent)
+        if storm and storm["action"]=="summary": intent["message"]=f"🌪️ [告警風暴摘要]\n同一主機在短時間內已有 {storm['count']} 個告警事件\n最新事件：{intent['message']}"
         selected,route,rendered=await asyncio.to_thread(resolve_notification_route,intent,enabled)
         intent["message"]=rendered["message"]; intent["routeId"]=route["id"] if route else None
         suppressed=False; reason=""
@@ -3948,6 +3968,7 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
                 if inhibition: suppressed=True; reason=f"相依抑制：{inhibition['name']}"
                 elif maintenance: suppressed=True; reason=f"維護時段：{maintenance['name']}"
                 elif silence: suppressed=True; reason=f"靜音規則：{silence['name']}"
+                elif storm and storm["action"]=="suppress": suppressed=True; reason=f"告警風暴保護：{storm['id']}"
                 elif policy and policy["quiet_enabled"] and not(intent.get("severity")=="critical" and policy["critical_bypass"]):
                     hour=datetime.now(timezone.utc).hour; start=policy["quiet_start_hour"]; end=policy["quiet_end_hour"]
                     if (start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end: suppressed=True; reason="全域安靜時段"
@@ -4822,6 +4843,22 @@ def read_alert_correlations()->dict[str,Any]:
 
 @app.get("/api/alert-correlations")
 async def list_alert_correlations(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_correlations)
+
+def read_alert_storms()->dict[str,Any]:
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM alert_storm_policy WHERE id=1").fetchone()
+        connection.execute("UPDATE alert_storms SET status='ended',ended_at=COALESCE(ended_at,NOW()) WHERE status='active' AND last_event_at<NOW()-(%s*INTERVAL '1 minute')",(policy["cooldown_minutes"],))
+        rows=connection.execute("SELECT s.*,h.name AS host_name FROM alert_storms s JOIN managed_hosts h ON h.id=s.host_id ORDER BY CASE WHEN s.status='active' THEN 0 ELSE 1 END,s.last_event_at DESC LIMIT 100").fetchall()
+    return {"policy":{"enabled":policy["enabled"],"windowMinutes":policy["window_minutes"],"eventThreshold":policy["event_threshold"],"cooldownMinutes":policy["cooldown_minutes"]},"storms":[{"id":r["id"],"hostId":r["host_id"],"hostName":r["host_name"],"status":r["status"],"eventCount":r["event_count"],"startedAt":r["started_at"].isoformat(),"lastEventAt":r["last_event_at"].isoformat(),"summarySentAt":r["summary_sent_at"].isoformat() if r["summary_sent_at"] else None,"endedAt":r["ended_at"].isoformat() if r["ended_at"] else None} for r in rows]}
+
+@app.get("/api/alert-storms")
+async def list_alert_storms(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_storms)
+
+@app.put("/api/alert-storms/policy")
+async def update_alert_storm_policy(payload:AlertStormPolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE alert_storm_policy SET enabled=%s,window_minutes=%s,event_threshold=%s,cooldown_minutes=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.enabled,payload.window_minutes,payload.event_threshold,payload.cooldown_minutes,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"alerts.storm.policy.update","更新告警風暴政策",str(payload.enabled)); return await asyncio.to_thread(read_alert_storms)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:
