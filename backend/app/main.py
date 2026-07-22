@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.2.0").strip() or "3.2.0"
-MIN_COMPATIBLE_SCHEMA = "024"
+APP_VERSION = os.getenv("APP_VERSION", "3.3.0").strip() or "3.3.0"
+MIN_COMPATIBLE_SCHEMA = "025"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -881,7 +881,7 @@ class OnCallHandoffCreate(BaseModel):
     model_config={"populate_by_name":True}
 
 class OnCallCoveragePolicyUpdate(BaseModel):
-    horizon_hours:int=Field(alias="horizonHours",ge=1,le=720); target_percent:float=Field(alias="targetPercent",ge=1,le=100)
+    horizon_hours:int=Field(alias="horizonHours",ge=1,le=720); target_percent:float=Field(alias="targetPercent",ge=1,le=100); alert_enabled:bool|None=Field(default=None,alias="alertEnabled"); alert_lead_hours:int|None=Field(default=None,alias="alertLeadHours",ge=1,le=168)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -2115,6 +2115,7 @@ async def lifespan(_: FastAPI):
     report_task = asyncio.create_task(scheduled_report_loop(), name="scheduled-report-worker")
     escalation_task = asyncio.create_task(notification_escalation_loop(), name="notification-escalation-worker")
     ownership_sla_task = asyncio.create_task(alert_ownership_sla_loop(), name="alert-ownership-sla-worker")
+    on_call_gap_task = asyncio.create_task(on_call_gap_alert_loop(), name="on-call-gap-alert-worker")
     rollup_task = asyncio.create_task(metric_rollup_loop(), name="metric-rollup-worker")
     try:
         yield
@@ -2132,6 +2133,7 @@ async def lifespan(_: FastAPI):
         report_task.cancel()
         escalation_task.cancel()
         ownership_sla_task.cancel()
+        on_call_gap_task.cancel()
         rollup_task.cancel()
         try:
             await asyncio.gather(
@@ -2145,6 +2147,7 @@ async def lifespan(_: FastAPI):
                 report_task,
                 escalation_task,
                 ownership_sla_task,
+                on_call_gap_task,
                 rollup_task,
             )
         except asyncio.CancelledError:
@@ -4954,6 +4957,7 @@ def read_on_call_coverage()->dict[str,Any]:
     with connect_db() as connection:
         policy=connection.execute("SELECT * FROM on_call_coverage_policy WHERE id=1").fetchone(); end=now+timedelta(hours=policy["horizon_hours"])
         rows=connection.execute("""SELECT s.starts_at,s.ends_at,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND s.ends_at>%s AND s.starts_at<%s ORDER BY s.starts_at""",(now,end)).fetchall()
+        history=connection.execute("SELECT * FROM on_call_gap_alerts ORDER BY notified_at DESC LIMIT 100").fetchall()
     intervals=[]
     for row in rows:
         start=max(now,row["starts_at"]); finish=min(end,row["ends_at"])
@@ -4965,7 +4969,7 @@ def read_on_call_coverage()->dict[str,Any]:
         cursor=max(cursor,finish)
     if cursor<end: gaps.append({"startsAt":cursor.isoformat(),"endsAt":end.isoformat(),"durationMinutes":round((end-cursor).total_seconds()/60)})
     total=policy["horizon_hours"]*3600; uncovered=sum(g["durationMinutes"]*60 for g in gaps); coverage=round(max(0,100*(total-uncovered)/total),2)
-    return {"policy":{"horizonHours":policy["horizon_hours"],"targetPercent":float(policy["target_percent"])},"summary":{"coveragePercent":coverage,"targetMet":coverage>=float(policy["target_percent"]),"gapCount":len(gaps),"uncoveredMinutes":round(uncovered/60)},"gaps":gaps}
+    return {"policy":{"horizonHours":policy["horizon_hours"],"targetPercent":float(policy["target_percent"]),"alertEnabled":policy["alert_enabled"],"alertLeadHours":policy["alert_lead_hours"]},"summary":{"coveragePercent":coverage,"targetMet":coverage>=float(policy["target_percent"]),"gapCount":len(gaps),"uncoveredMinutes":round(uncovered/60)},"gaps":gaps,"history":[{"id":h["id"],"startsAt":h["gap_starts_at"].isoformat(),"endsAt":h["gap_ends_at"].isoformat(),"status":h["status"],"deliveryCount":h["delivery_count"],"detail":h["detail"],"notifiedAt":h["notified_at"].isoformat(),"resolvedAt":h["resolved_at"].isoformat() if h["resolved_at"] else None} for h in history]}
 
 @app.get("/api/on-call-coverage")
 async def get_on_call_coverage(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_coverage)
@@ -4973,8 +4977,35 @@ async def get_on_call_coverage(request:Request)->dict[str,Any]: require_permissi
 @app.put("/api/on-call-coverage/policy")
 async def put_on_call_coverage_policy(payload:OnCallCoveragePolicyUpdate,request:Request)->dict[str,Any]:
     actor=require_permission(request,"alerts.manage")
-    with connect_db() as connection: connection.execute("UPDATE on_call_coverage_policy SET horizon_hours=%s,target_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.horizon_hours,payload.target_percent,actor["id"]))
+    with connect_db() as connection: connection.execute("UPDATE on_call_coverage_policy SET horizon_hours=%s,target_percent=%s,alert_enabled=COALESCE(%s,alert_enabled),alert_lead_hours=COALESCE(%s,alert_lead_hours),updated_at=NOW(),updated_by=%s WHERE id=1",(payload.horizon_hours,payload.target_percent,payload.alert_enabled,payload.alert_lead_hours,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"on_call.coverage.policy.update","更新值班覆蓋政策",str(payload.model_dump())); return await asyncio.to_thread(read_on_call_coverage)
+
+def claim_on_call_gap_alerts()->list[dict[str,Any]]:
+    report=read_on_call_coverage(); now=datetime.now(timezone.utc); claimed=[]
+    fingerprints={hashlib.sha256(g["endsAt"].encode()).hexdigest() for g in report["gaps"]}
+    with connect_db() as connection:
+        active=connection.execute("SELECT id,fingerprint FROM on_call_gap_alerts WHERE status<>'resolved'").fetchall()
+        for row in active:
+            if row["fingerprint"] not in fingerprints: connection.execute("UPDATE on_call_gap_alerts SET status='resolved',resolved_at=NOW() WHERE id=%s",(row["id"],))
+        if not report["policy"]["alertEnabled"]: return []
+        lead=now+timedelta(hours=report["policy"]["alertLeadHours"])
+        for gap in report["gaps"]:
+            start=datetime.fromisoformat(gap["startsAt"])
+            if start>lead: continue
+            fingerprint=hashlib.sha256(gap["endsAt"].encode()).hexdigest(); aid=f"gap-{uuid.uuid4().hex[:20]}"
+            row=connection.execute("INSERT INTO on_call_gap_alerts(id,fingerprint,gap_starts_at,gap_ends_at,status) VALUES(%s,%s,%s,%s,'queued') ON CONFLICT(fingerprint) DO NOTHING RETURNING id",(aid,fingerprint,gap["startsAt"],gap["endsAt"])).fetchone()
+            if row: claimed.append({"id":aid,**gap})
+    return claimed
+
+async def on_call_gap_alert_loop()->None:
+    while True:
+        try:
+            for gap in await asyncio.to_thread(claim_on_call_gap_alerts):
+                message=f"📅 [值班缺口] {gap['startsAt']} 至 {gap['endsAt']}\n無人值班 {gap['durationMinutes']} 分鐘"
+                results=await dispatch_notifications([{"eventId":None,"kind":"on_call_gap","severity":"warning","message":message,"retryKey":f"on-call-gap:{gap['id']}"}]); enabled=any(c["enabled"] for c in notification_channels()); status="sent" if any(r["status"]=="sent" for r in results) else "failed" if results else "suppressed" if enabled else "no_channel"
+                with connect_db() as connection: connection.execute("UPDATE on_call_gap_alerts SET status=%s,delivery_count=%s,detail=%s WHERE id=%s",(status,sum(r["status"]=="sent" for r in results),"值班缺口通知已處理",gap["id"]))
+        except Exception as error: print(f"on-call gap alert error: {error}",flush=True)
+        await asyncio.sleep(300)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:

@@ -377,6 +377,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/on-call-coverage',source); self.assertIn("intervals[-1][1]",source); self.assertIn("uncoveredMinutes",source)
         self.assertIn("值班覆蓋率與缺口",ui); self.assertIn("觀察範圍內沒有值班缺口",ui)
 
+    def test_on_call_gap_alerts_are_deduplicated_and_resolved(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"025_on_call_gap_alerts.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_gap_alerts",migration); self.assertIn("fingerprint TEXT NOT NULL UNIQUE",migration); self.assertIn("alert_lead_hours",migration)
+        self.assertIn("on_call_gap_alert_loop",source); self.assertIn("ON CONFLICT(fingerprint) DO NOTHING",source); self.assertIn("status='resolved'",source)
+        self.assertIn("值班缺口自動通知",ui); self.assertIn("啟用值班缺口通知",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

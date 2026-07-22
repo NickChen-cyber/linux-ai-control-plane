@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v3.2.0-on-call-coverage.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v3.3.0-on-call-gap-alerts.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -107,6 +107,10 @@ Schema 應為 `023`。先建立一筆目前或未來值班，再到「值班交�
 ## 3.2.0 升級後驗證
 
 Schema 應為 `024`。到「值班覆蓋率與缺口」重新計算；若未來 168 小時沒有完整排班，應列出各缺口時間，補上班次後覆蓋率應提高。
+
+## 3.3.0 升級後驗證
+
+Schema 應為 `025`。到「值班缺口自動通知」確認功能已啟用且預設提前 24 小時；符合範圍的缺口最多約 5 分鐘建立一次通知紀錄，補班後狀態轉為 `resolved`。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \
