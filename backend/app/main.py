@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.4.0").strip() or "3.4.0"
-MIN_COMPATIBLE_SCHEMA = "026"
+APP_VERSION = os.getenv("APP_VERSION", "3.5.0").strip() or "3.5.0"
+MIN_COMPATIBLE_SCHEMA = "027"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -886,6 +886,10 @@ class OnCallCoveragePolicyUpdate(BaseModel):
 
 class OnCallTemplateCreate(BaseModel):
     name:str=Field(min_length=2,max_length=100); user_id:str=Field(alias="userId",max_length=100); first_starts_at:datetime=Field(alias="firstStartsAt"); interval_days:int=Field(alias="intervalDays",ge=1,le=31); duration_minutes:int=Field(alias="durationMinutes",ge=30,le=10080); horizon_days:int=Field(default=30,alias="horizonDays",ge=1,le=180)
+    model_config={"populate_by_name":True}
+
+class OnCallFairnessPolicyUpdate(BaseModel):
+    window_days:int=Field(alias="windowDays",ge=1,le=180); imbalance_percent:float=Field(alias="imbalancePercent",ge=1,le=100)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -5065,6 +5069,32 @@ async def recurring_on_call_loop()->None:
         try: await asyncio.to_thread(materialize_on_call_templates)
         except Exception as error: print(f"recurring on-call error: {error}",flush=True)
         await asyncio.sleep(3600)
+
+def read_on_call_fairness()->dict[str,Any]:
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM on_call_fairness_policy WHERE id=1").fetchone()
+        rows=connection.execute("""SELECT u.id,u.username,u.display_name,
+          COALESCE((SELECT SUM(EXTRACT(EPOCH FROM(LEAST(s.ends_at,NOW()+(%s*INTERVAL '1 day'))-GREATEST(s.starts_at,NOW())))/3600) FROM on_call_shifts s WHERE s.user_id=u.id AND s.enabled=TRUE AND s.ends_at>NOW() AND s.starts_at<NOW()+(%s*INTERVAL '1 day')),0) AS scheduled_hours,
+          (SELECT COUNT(*) FROM alert_events e WHERE e.assignee_id=u.id AND e.status IN ('firing','acknowledged')) AS active_alerts,
+          (SELECT COUNT(*) FROM on_call_handoffs h WHERE h.to_user_id=u.id AND h.handed_off_at>=NOW()-(%s*INTERVAL '1 day')) AS handoffs_in,
+          (SELECT COUNT(*) FROM on_call_handoffs h WHERE h.from_user_id=u.id AND h.handed_off_at>=NOW()-(%s*INTERVAL '1 day')) AS handoffs_out,
+          (SELECT COUNT(*) FROM alert_sla_escalations a JOIN alert_events e ON e.id=a.alert_event_id WHERE e.assignee_id=u.id AND a.breached_at>=NOW()-(%s*INTERVAL '1 day')) AS sla_breaches
+          FROM platform_users u WHERE u.enabled=TRUE ORDER BY u.display_name""",(policy["window_days"],policy["window_days"],policy["window_days"],policy["window_days"],policy["window_days"])).fetchall()
+    average=sum(float(r["scheduled_hours"]) for r in rows)/len(rows) if rows else 0; threshold=float(policy["imbalance_percent"])
+    users=[]
+    for row in rows:
+        hours=round(float(row["scheduled_hours"]),2); deviation=round(100*(hours-average)/average,2) if average else 0
+        users.append({"id":row["id"],"username":row["username"],"displayName":row["display_name"],"scheduledHours":hours,"deviationPercent":deviation,"imbalanced":abs(deviation)>threshold,"activeAlerts":row["active_alerts"],"handoffsIn":row["handoffs_in"],"handoffsOut":row["handoffs_out"],"slaBreaches":row["sla_breaches"]})
+    return {"policy":{"windowDays":policy["window_days"],"imbalancePercent":threshold},"summary":{"averageHours":round(average,2),"totalHours":round(sum(u["scheduledHours"] for u in users),2),"imbalancedUsers":sum(u["imbalanced"] for u in users)},"users":users}
+
+@app.get("/api/on-call-fairness")
+async def get_on_call_fairness(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_fairness)
+
+@app.put("/api/on-call-fairness/policy")
+async def put_on_call_fairness_policy(payload:OnCallFairnessPolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE on_call_fairness_policy SET window_days=%s,imbalance_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.window_days,payload.imbalance_percent,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"on_call.fairness.policy.update","更新值班公平性政策",str(payload.model_dump())); return await asyncio.to_thread(read_on_call_fairness)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:

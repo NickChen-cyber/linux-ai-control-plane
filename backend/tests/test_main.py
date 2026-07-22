@@ -389,6 +389,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("materialize_on_call_templates",source); self.assertIn("starts_at<%s AND ends_at>%s",source); self.assertIn("recurring_on_call_loop",source)
         self.assertIn("週期值班範本",ui); self.assertIn("建立並展開",ui)
 
+    def test_on_call_fairness_combines_schedule_and_operational_load(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"027_on_call_fairness.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_fairness_policy",migration); self.assertIn("imbalance_percent",migration)
+        self.assertIn('/api/on-call-fairness',source); self.assertIn("scheduled_hours",source); self.assertIn("sla_breaches",source); self.assertIn("handoffs_in",source)
+        self.assertIn("值班負載與公平性",ui); self.assertIn("偏離平均",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

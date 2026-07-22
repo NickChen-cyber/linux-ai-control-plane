@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v3.4.0-recurring-on-call.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-postgresql-v3.5.0-on-call-fairness.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -115,6 +115,10 @@ Schema 應為 `025`。到「值班缺口自動通知」確認功能已啟用且�
 ## 3.4.0 升級後驗證
 
 Schema 應為 `026`。到「週期值班範本」建立每週班次，確認未來班次數增加；再次按「立即展開」不應建立重複班次。
+
+## 3.5.0 升級後驗證
+
+Schema 應為 `027`。到「值班負載與公平性」重新計算，確認所有啟用使用者的排班時數、偏離比例、告警及交接統計可見。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \
