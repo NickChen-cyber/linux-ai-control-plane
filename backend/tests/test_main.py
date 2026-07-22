@@ -307,6 +307,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("kind<>'test'",source); self.assertIn("status IN ('sent','failed')",source)
         self.assertIn("通知交付健康度",ui); self.assertIn("最低樣本數",ui)
 
+    def test_maintenance_windows_keep_evidence_but_pause_notifications(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"015_maintenance_windows.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("maintenance_windows",migration); self.assertIn("pause_escalations",migration)
+        self.assertIn("維護時段：",source); self.assertIn("NOT EXISTS(SELECT 1 FROM maintenance_windows",source)
+        self.assertIn("維護時段管理",ui); self.assertIn("持續採集與保存告警證據",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

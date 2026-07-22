@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.2.0").strip() or "2.2.0"
-MIN_COMPATIBLE_SCHEMA = "014"
+APP_VERSION = os.getenv("APP_VERSION", "2.3.0").strip() or "2.3.0"
+MIN_COMPATIBLE_SCHEMA = "015"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -856,6 +856,12 @@ class NotificationRetryAction(BaseModel):
 
 class NotificationDeliveryPolicyUpdate(BaseModel):
     window_days:int=Field(alias="windowDays",ge=1,le=90); success_target:float=Field(alias="successTarget",ge=50,le=100); minimum_samples:int=Field(alias="minimumSamples",ge=1,le=1000)
+    model_config={"populate_by_name":True}
+
+class MaintenanceWindowCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=100); host_id:str|None=Field(default=None,alias="hostId",max_length=100); rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
+    starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); reason:str=Field(min_length=2,max_length=500)
+    suppress_notifications:bool=Field(default=True,alias="suppressNotifications"); pause_escalations:bool=Field(default=True,alias="pauseEscalations")
     model_config={"populate_by_name":True}
 
 
@@ -3927,9 +3933,12 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
             with connect_db() as connection:
                 policy=connection.execute("SELECT * FROM notification_governance_policy WHERE id=1").fetchone()
                 silence=None
+                maintenance=None
                 if intent.get("eventId"):
                     silence=connection.execute("""SELECT s.name FROM alert_silences s JOIN alert_events e ON e.id=%s WHERE s.starts_at<=NOW() AND s.ends_at>NOW() AND (s.host_id IS NULL OR s.host_id=e.host_id) AND (s.rule_id IS NULL OR s.rule_id=e.rule_id) ORDER BY s.created_at DESC LIMIT 1""",(intent["eventId"],)).fetchone()
-                if silence: suppressed=True; reason=f"靜音規則：{silence['name']}"
+                    maintenance=connection.execute("""SELECT m.name FROM maintenance_windows m JOIN alert_events e ON e.id=%s WHERE m.suppress_notifications=TRUE AND m.starts_at<=NOW() AND m.ends_at>NOW() AND (m.host_id IS NULL OR m.host_id=e.host_id) AND (m.rule_id IS NULL OR m.rule_id=e.rule_id) ORDER BY m.created_at DESC LIMIT 1""",(intent["eventId"],)).fetchone()
+                if maintenance: suppressed=True; reason=f"維護時段：{maintenance['name']}"
+                elif silence: suppressed=True; reason=f"靜音規則：{silence['name']}"
                 elif policy and policy["quiet_enabled"] and not(intent.get("severity")=="critical" and policy["critical_bypass"]):
                     hour=datetime.now(timezone.utc).hour; start=policy["quiet_start_hour"]; end=policy["quiet_end_hour"]
                     if (start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end: suppressed=True; reason="全域安靜時段"
@@ -4117,7 +4126,7 @@ def claim_escalation_reminders()->list[dict[str,Any]]:
         if not policy or not policy["enabled"]: return []
         rows=connection.execute("""SELECT e.id,e.severity,e.message,e.started_at,COUNT(n.id) AS reminders,MAX(n.attempted_at) AS last_attempt
           FROM alert_events e LEFT JOIN notification_escalations n ON n.alert_event_id=e.id
-          WHERE e.status='firing' GROUP BY e.id HAVING COUNT(n.id)<%s ORDER BY e.started_at LIMIT 50""",(policy["max_reminders"],)).fetchall()
+          WHERE e.status='firing' AND NOT EXISTS(SELECT 1 FROM maintenance_windows m WHERE m.pause_escalations=TRUE AND m.starts_at<=NOW() AND m.ends_at>NOW() AND (m.host_id IS NULL OR m.host_id=e.host_id) AND (m.rule_id IS NULL OR m.rule_id=e.rule_id)) GROUP BY e.id HAVING COUNT(n.id)<%s ORDER BY e.started_at LIMIT 50""",(policy["max_reminders"],)).fetchall()
         now=datetime.now(timezone.utc)
         for row in rows:
             interval=policy["critical_interval_minutes"] if row["severity"]=="critical" else policy["warning_interval_minutes"]
@@ -4734,6 +4743,30 @@ async def delete_alert_silence(silence_id:str,request:Request)->Response:
     with connect_db() as connection: row=connection.execute("DELETE FROM alert_silences WHERE id=%s RETURNING name",(silence_id,)).fetchone()
     if not row: raise HTTPException(status_code=404,detail="靜音規則不存在")
     await asyncio.to_thread(record_backend_audit,request,"notifications.silence.delete","刪除告警靜音",row["name"]); return Response(status_code=204)
+
+def read_maintenance_windows()->dict[str,Any]:
+    with connect_db() as connection: rows=connection.execute("SELECT *,starts_at<=NOW() AND ends_at>NOW() AS active,starts_at>NOW() AS upcoming FROM maintenance_windows ORDER BY CASE WHEN ends_at>NOW() THEN 0 ELSE 1 END,starts_at LIMIT 100").fetchall()
+    return {"windows":[{"id":r["id"],"name":r["name"],"hostId":r["host_id"],"ruleId":r["rule_id"],"startsAt":r["starts_at"].isoformat(),"endsAt":r["ends_at"].isoformat(),"reason":r["reason"],"suppressNotifications":r["suppress_notifications"],"pauseEscalations":r["pause_escalations"],"active":r["active"],"upcoming":r["upcoming"]} for r in rows]}
+
+@app.get("/api/maintenance-windows")
+async def list_maintenance_windows(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_maintenance_windows)
+
+@app.post("/api/maintenance-windows",status_code=201)
+async def create_maintenance_window(payload:MaintenanceWindowCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    if payload.ends_at<=payload.starts_at: raise HTTPException(status_code=422,detail="維護結束時間必須晚於開始時間")
+    with connect_db() as connection:
+        if payload.host_id and not connection.execute("SELECT 1 FROM managed_hosts WHERE id=%s",(payload.host_id,)).fetchone(): raise HTTPException(status_code=404,detail="主機不存在")
+        if payload.rule_id and not connection.execute("SELECT 1 FROM alert_rules WHERE id=%s",(payload.rule_id,)).fetchone(): raise HTTPException(status_code=404,detail="告警規則不存在")
+        connection.execute("INSERT INTO maintenance_windows(id,name,host_id,rule_id,starts_at,ends_at,reason,suppress_notifications,pause_escalations,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(f"mtw-{uuid.uuid4().hex[:20]}",payload.name,payload.host_id,payload.rule_id,payload.starts_at,payload.ends_at,payload.reason,payload.suppress_notifications,payload.pause_escalations,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"maintenance.window.create","建立維護時段",payload.name); return await asyncio.to_thread(read_maintenance_windows)
+
+@app.delete("/api/maintenance-windows/{window_id}",status_code=204)
+async def delete_maintenance_window(window_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: row=connection.execute("DELETE FROM maintenance_windows WHERE id=%s RETURNING name",(window_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="維護時段不存在")
+    await asyncio.to_thread(record_backend_audit,request,"maintenance.window.delete","刪除維護時段",row["name"]); return Response(status_code=204)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:
