@@ -288,6 +288,8 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('snapshot_dir="$project_dir/release-snapshots"',script)
         self.assertNotIn('snapshot="$project_dir/../',script)
         self.assertIn("--exclude='./release-snapshots'",script)
+        self.assertIn("grep -Fqx",script)
+        self.assertIn("可能多包了一層目錄",script)
 
     def test_notification_routes_are_prioritized_and_have_fallback(self):
         project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"012_notification_routing.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()

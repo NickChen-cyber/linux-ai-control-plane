@@ -15,8 +15,8 @@ snapshot="$snapshot_dir/linux-ai-agent-program-$stamp.tar.gz"
 tar --exclude='./.env' --exclude='./secrets' --exclude='./node_modules' --exclude='./outputs' --exclude='./release-snapshots' --exclude='./.git' -czf "$snapshot" -C "$project_dir" .
 echo "已建立程式回復點：$snapshot"
 
-if ! tar -tzf "$archive" | grep -q 'compose.yaml'; then
-  echo "發布包缺少 compose.yaml，停止更新"
+if ! tar -tzf "$archive" | grep -Fqx -e 'compose.yaml' -e './compose.yaml'; then
+  echo "發布包根目錄缺少 compose.yaml（可能多包了一層目錄），停止更新"
   exit 3
 fi
 
