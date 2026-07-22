@@ -637,6 +637,14 @@ MFA 設定、復原碼輪替、MFA 停用、祕密新增／輪替／刪除、SSH
 - `tests/run-integration.sh` 對已部署環境驗證登入、MFA 狀態、主機採集、告警、維運白名單、備份還原狀態、Schema 相容性與登出。設定 `INTEGRATION_MUTATIONS=1` 才會執行安全的採集與備份建立。
 - 小螢幕介面支援橫向表格、底部 Modal、行動版導覽、任務篩選分頁及一致的載入／錯誤訊息。
 
+## 1.1 第二階段：容量與生命週期
+
+- API 只負責核准及排入 PostgreSQL 佇列；`maintenance-worker` 獨立領取任務，即使 API 重啟也不會直接把正常任務判定失敗。
+- Worker 使用 `FOR UPDATE SKIP LOCKED` 安全領取工作、回報心跳，並維持同一台主機同時最多一個維運任務。UI 可取消排隊或執行中的工作。
+- `API_RATE_LIMIT_PER_MINUTE` 與 `SSH_MAX_CONCURRENCY` 控制中央負載；Compose 另對 PostgreSQL、API、Worker、備份、UI 與 Gateway 設置 CPU、記憶體及 PID 上限。
+- 「備份管理」可調整告警、維運、效能、巡檢、盤點、登入與中央日誌的保存期限，先預覽再清理。稽核鏈預設保留 3,650 天且標記為受保護，不接受 UI 清理。
+- `tests/test-migrations.sh` 驗證 001 → 002 → 003 及 003 rollback；`tests/run-integration.sh` 可在 AiAgnet 驗證真實登入、主機、Worker、備份、保存政策與 Schema。
+
 ### 正式安裝檢查
 
 ```bash

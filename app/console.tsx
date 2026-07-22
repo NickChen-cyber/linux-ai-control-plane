@@ -2578,6 +2578,24 @@ type ReplicationStatus = {
   slots: Array<{ slotName: string; slotType: string; active: boolean; restartLsn?: string | null; walStatus?: string | null }>;
 };
 
+type RetentionPolicy = { dataset:string; retentionDays:number; protected:boolean; updatedAt:string };
+const retentionLabels:Record<string,string> = {
+  audit_events:"稽核事件",alert_events:"已結案告警",maintenance_tasks:"已結束維運任務",
+  host_metrics:"主機效能樣本",automation_runs:"巡檢執行紀錄",inventory_scans:"資產／修補／安全掃描",
+  login_events:"登入紀錄",central_logs:"中央日誌",
+};
+
+function RetentionCenter({canManage}:{canManage:boolean}) {
+  const [policies,setPolicies]=useState<RetentionPolicy[]>([]);
+  const [preview,setPreview]=useState<Record<string,number>|null>(null);
+  const [busy,setBusy]=useState(false); const [error,setError]=useState("");
+  const load=useCallback(async()=>{const response=await fetch("/api/retention",{cache:"no-store"});const body=await response.json() as {policies?:RetentionPolicy[];detail?:string};if(!response.ok)throw new Error(body.detail||"無法讀取保存政策");setPolicies(body.policies??[]);},[]);
+  useEffect(()=>{void load().catch(reason=>setError(reason instanceof Error?reason.message:"載入失敗"));},[load]);
+  const save=async()=>{setBusy(true);setError("");try{const response=await fetch("/api/retention",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({policies:policies.filter(item=>!item.protected)})});const body=await response.json() as {policies?:RetentionPolicy[];detail?:string};if(!response.ok)throw new Error(body.detail||"儲存失敗");setPolicies(body.policies??[]);}catch(reason){setError(reason instanceof Error?reason.message:"儲存失敗");}finally{setBusy(false)}};
+  const run=async(commit:boolean)=>{if(commit&&!window.confirm("確定刪除超過保存期限的歷史資料？稽核資料不會刪除。"))return;setBusy(true);setError("");try{const response=await fetch(`/api/retention/${commit?"run":"preview"}`,{method:"POST"});const body=await response.json() as {result?:Record<string,number>;detail?:string};if(!response.ok)throw new Error(body.detail||"執行失敗");setPreview(body.result??{});await load();}catch(reason){setError(reason instanceof Error?reason.message:"執行失敗");}finally{setBusy(false)}};
+  return <div className="card retention-center"><header className="alert-section-head"><div><small>DATA RETENTION POLICY</small><h2>資料保存與自動清理</h2></div>{canManage&&<div className="retention-actions"><button className="secondary-action" disabled={busy} onClick={()=>void run(false)}>預覽清理</button><button className="secondary-action" disabled={busy} onClick={()=>void save()}>儲存期限</button><button className="create" disabled={busy} onClick={()=>void run(true)}>{busy?"處理中…":"立即清理"}</button></div>}</header>{error&&<div className="log-error">{error}</div>}<div className="retention-grid">{policies.map((item,index)=><label key={item.dataset}><span><strong>{retentionLabels[item.dataset]||item.dataset}</strong><small>{item.protected?"受保護，不自動刪除":preview?`預計清理 ${preview[item.dataset]||0} 筆`:"超過期限後每日清理"}</small></span><input type="number" min={1} max={3650} disabled={!canManage||item.protected||busy} value={item.retentionDays} onChange={event=>setPolicies(current=>current.map((row,rowIndex)=>rowIndex===index?{...row,retentionDays:Number(event.target.value)}:row))}/><em>天</em></label>)}</div></div>;
+}
+
 function Backups({
   hosts,
   canManage,
@@ -2710,6 +2728,8 @@ function Backups({
           <span><strong>{latest?.completedAt ? new Date(latest.completedAt).toLocaleDateString("zh-TW") : "—"}</strong>最近成功</span>
         </div>
       </div>
+
+      <RetentionCenter canManage={canManage} />
 
       <div className="card recovery-readiness">
         <header className="alert-section-head"><div><small>COLD STANDBY READINESS</small><h2>冷備復原資料</h2></div><span className={`backup-status ${recoveryReady ? "success" : "running"}`}>{recoveryReady ? "資料齊備" : "等待新備份"}</span></header>
@@ -3295,7 +3315,7 @@ type MaintenanceTask = {
   cancelRequestedAt?: string | null;
   requestNote: string;
   decisionNote: string;
-  status: "pending" | "approved" | "rejected" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
+  status: "pending" | "approved" | "queued" | "rejected" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
   output?: string | null;
   error?: string | null;
   requestedBy: string;
@@ -3456,7 +3476,7 @@ function MaintenanceTasks({
 
   const selectedRunbook = runbooks.find((item) => item.id === selectedRunbookId);
   const statusText: Record<MaintenanceTask["status"], string> = {
-    pending: "待核准", approved: "已核准", rejected: "已拒絕",
+    pending: "待核准", approved: "已核准", queued: "排隊中", rejected: "已拒絕",
     running: "執行中", succeeded: "成功", failed: "失敗", cancelled: "已取消", timed_out: "已逾時",
   };
   const riskText = { low: "低風險", medium: "中風險", high: "高風險" } as const;
@@ -3504,7 +3524,7 @@ function MaintenanceTasks({
               {task.status === "pending" && canApprove && <><button onClick={() => void transition(task, "reject")}>拒絕</button><button className="secondary-action" onClick={() => void transition(task, "approve")}>核准</button></>}
               {task.status === "approved" && approvalExpired(task) && <small>核准已過期，請重新建立任務</small>}
               {task.status === "approved" && !approvalExpired(task) && canExecute && <button className="create" onClick={() => void transition(task, "execute")} disabled={busy === `${task.id}:execute`}>{busy === `${task.id}:execute` ? "執行中…" : task.riskLevel === "high" ? "確認並執行高風險任務" : "執行已核准任務"}</button>}
-              {["pending","approved","running"].includes(task.status) && canExecute && <button className="danger-action" onClick={() => void controlTask(task,"cancel")} disabled={busy === `${task.id}:cancel`}>{busy === `${task.id}:cancel` ? "取消中…" : "取消任務"}</button>}
+              {["pending","approved","queued","running"].includes(task.status) && canExecute && <button className="danger-action" onClick={() => void controlTask(task,"cancel")} disabled={busy === `${task.id}:cancel`}>{busy === `${task.id}:cancel` ? "取消中…" : "取消任務"}</button>}
               {["failed","timed_out","cancelled"].includes(task.status) && canRequest && <button className="secondary-action" onClick={() => void controlTask(task,"retry")} disabled={busy === `${task.id}:retry`}>{busy === `${task.id}:retry` ? "建立中…" : "安全重試"}</button>}
             </div>
             {(task.output || task.error) && <details><summary>查看執行結果與完整性資訊</summary><p className="verification-method">{task.verificationMethod}{task.outputSha256 && <code>SHA-256 {task.outputSha256}</code>}</p><pre>{task.output || task.error}</pre></details>}

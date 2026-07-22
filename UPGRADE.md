@@ -5,9 +5,25 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.0.0.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.1.0.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
 
 資料庫回復應使用「備份管理」中已通過還原演練的 DB 備份；程式回復與資料庫回復是兩個獨立步驟。不得把舊版程式直接接到不相容的新 Schema。
+
+## 1.1.0 升級後驗證
+
+```bash
+docker compose -f compose.yaml -f compose.https.yaml ps
+docker compose -f compose.yaml -f compose.https.yaml logs --tail=80 maintenance-worker
+curl -k https://192.168.0.151:8443/api/health
+```
+
+登入後到「備份管理」確認「資料保存與自動清理」已出現；到「維運任務」執行一個低風險唯讀 Runbook，狀態應依序由「已核准 → 排隊中 → 執行中 → 成功」。
+
+Migration 003 的正向與反向測試只會使用可拋棄的測試容器，不碰正式資料庫：
+
+```bash
+sh tests/test-migrations.sh
+```

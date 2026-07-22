@@ -29,6 +29,9 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-1g}
+    cpus: ${POSTGRES_CPU_LIMIT:-1.5}
+    pids_limit: 256
 
   api:
     build:
@@ -37,7 +40,7 @@ services:
     restart: unless-stopped
     environment:
       PGHOST: postgres
-      APP_VERSION: ${APP_VERSION:-1.0.0}
+      APP_VERSION: ${APP_VERSION:-1.1.0}
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-linux_ai}
       PGUSER: ${POSTGRES_USER:-linux_ai}
@@ -76,6 +79,8 @@ services:
       CENTRAL_LOG_RETENTION_DAYS: ${CENTRAL_LOG_RETENTION_DAYS:-30}
       MAINTENANCE_APPROVAL_TTL_MINUTES: ${MAINTENANCE_APPROVAL_TTL_MINUTES:-60}
       PLATFORM_MASTER_KEY: ${PLATFORM_MASTER_KEY:-}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-240}
+      SSH_MAX_CONCURRENCY: ${SSH_MAX_CONCURRENCY:-8}
       CONFIG_REPO_PATH: /var/lib/linux-ai-config
       BACKUP_STORAGE_PATH: /backups
     volumes:
@@ -93,6 +98,9 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+    mem_limit: ${API_MEMORY_LIMIT:-768m}
+    cpus: ${API_CPU_LIMIT:-1.5}
+    pids_limit: 256
 
   backup:
     image: postgres:18-alpine
@@ -122,6 +130,39 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    mem_limit: ${BACKUP_MEMORY_LIMIT:-512m}
+    cpus: ${BACKUP_CPU_LIMIT:-1.0}
+    pids_limit: 128
+
+  maintenance-worker:
+    build:
+      context: ./backend
+      network: host
+    restart: unless-stopped
+    command: ["python", "-m", "app.maintenance_worker"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-linux_ai}
+      PGUSER: ${POSTGRES_USER:-linux_ai}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-linux-ai-lab-only-change-me}
+      APP_VERSION: ${APP_VERSION:-1.1.0}
+      INVENTORY_PATH: /app/config/inventory.json
+      SSH_KEY_PATH: /run/ssh/linux_ai_agent
+      KNOWN_HOSTS_PATH: /run/ssh/known_hosts
+      PLATFORM_MASTER_KEY: ${PLATFORM_MASTER_KEY:-}
+      MAINTENANCE_WORKER_CONCURRENCY: ${MAINTENANCE_WORKER_CONCURRENCY:-2}
+      MAINTENANCE_WORKER_POLL_SECONDS: ${MAINTENANCE_WORKER_POLL_SECONDS:-2}
+      SSH_MAX_CONCURRENCY: ${SSH_MAX_CONCURRENCY:-8}
+    volumes:
+      - ${SSH_KEY_PATH:-/home/nickc/.ssh/linux_ai_agent}:/run/ssh/linux_ai_agent:ro
+      - ${KNOWN_HOSTS_PATH:-/home/nickc/.ssh/known_hosts}:/run/ssh/known_hosts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    cpus: ${WORKER_CPU_LIMIT:-1.0}
+    pids_limit: 128
 
   ui:
     build:
@@ -133,6 +174,9 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    mem_limit: ${UI_MEMORY_LIMIT:-512m}
+    cpus: ${UI_CPU_LIMIT:-1.0}
+    pids_limit: 128
 
   gateway:
     image: nginx:1.29-alpine
@@ -144,6 +188,9 @@ services:
     depends_on:
       - ui
       - api
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-128m}
+    cpus: ${GATEWAY_CPU_LIMIT:-0.5}
+    pids_limit: 64
 
 volumes:
   postgres-data:

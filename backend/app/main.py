@@ -40,8 +40,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.0.0").strip() or "1.0.0"
-MIN_COMPATIBLE_SCHEMA = "002"
+APP_VERSION = os.getenv("APP_VERSION", "1.1.0").strip() or "1.1.0"
+MIN_COMPATIBLE_SCHEMA = "003"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -98,6 +98,8 @@ MAINTENANCE_APPROVAL_TTL_MINUTES = max(
     5, min(int(os.getenv("MAINTENANCE_APPROVAL_TTL_MINUTES", "60")), 1440)
 )
 PLATFORM_MASTER_KEY = os.getenv("PLATFORM_MASTER_KEY", "").strip()
+API_RATE_LIMIT_PER_MINUTE = max(30, int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "240")))
+SSH_MAX_CONCURRENCY = max(1, min(int(os.getenv("SSH_MAX_CONCURRENCY", "8")), 64))
 
 SAFE_RUNBOOKS: dict[str, dict[str, Any]] = {
     "system_overview": {
@@ -780,6 +782,16 @@ class IncidentTimelineNote(BaseModel):
 
 class ReleasePreflight(BaseModel):
     version: str = Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$", max_length=50)
+
+
+class RetentionPolicyItem(BaseModel):
+    dataset: str = Field(pattern="^(alert_events|maintenance_tasks|host_metrics|automation_runs|inventory_scans|login_events|central_logs)$")
+    retention_days: int = Field(alias="retentionDays", ge=1, le=3650)
+    model_config = {"populate_by_name": True}
+
+
+class RetentionPolicyUpdate(BaseModel):
+    policies: list[RetentionPolicyItem] = Field(min_length=1, max_length=7)
 
 
 class WatchdogHeartbeat(BaseModel):
@@ -1744,11 +1756,8 @@ def initialize_db() -> None:
             "CREATE INDEX IF NOT EXISTS maintenance_tasks_source_alert_idx "
             "ON maintenance_tasks(source_alert_id, requested_at DESC)"
         )
-        connection.execute(
-            """UPDATE maintenance_tasks SET status='failed', verification_status='failed',
-               error=COALESCE(error,'API 已重新啟動，無法確認原執行程序狀態'), completed_at=NOW()
-               WHERE status='running'"""
-        )
+        # Running jobs belong to the independent worker. The heartbeat reaper,
+        # rather than an API restart, decides whether an execution is stale.
         connection.execute(
             """UPDATE maintenance_tasks
                SET approval_expires_at=COALESCE(decided_at,NOW()) + make_interval(mins => %s)
@@ -2002,6 +2011,7 @@ async def lifespan(_: FastAPI):
     patch_inventory_task = asyncio.create_task(patch_inventory_loop(), name="patch-inventory-monitor")
     security_baseline_task = asyncio.create_task(security_baseline_loop(), name="security-baseline-monitor")
     maintenance_reaper_task = asyncio.create_task(maintenance_reaper_loop(), name="maintenance-task-reaper")
+    retention_task = asyncio.create_task(retention_cleanup_loop(), name="data-retention-worker")
     try:
         yield
     finally:
@@ -2013,6 +2023,7 @@ async def lifespan(_: FastAPI):
         patch_inventory_task.cancel()
         security_baseline_task.cancel()
         maintenance_reaper_task.cancel()
+        retention_task.cancel()
         try:
             await asyncio.gather(
                 monitor_task, backup_notification_task, notification_retry_task, central_log_task,
@@ -2020,6 +2031,7 @@ async def lifespan(_: FastAPI):
                 patch_inventory_task,
                 security_baseline_task,
                 maintenance_reaper_task,
+                retention_task,
             )
         except asyncio.CancelledError:
             pass
@@ -2033,6 +2045,27 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+api_rate_buckets: dict[str, list[float]] = {}
+api_rate_lock = threading.Lock()
+
+
+@app.middleware("http")
+async def bounded_api_requests(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.url.path not in {"/api/health"}:
+        now = time.monotonic()
+        source = request.client.host if request.client else "unknown"
+        with api_rate_lock:
+            recent = [stamp for stamp in api_rate_buckets.get(source, []) if now - stamp < 60]
+            if len(recent) >= API_RATE_LIMIT_PER_MINUTE:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "API 請求過於頻繁，請稍後再試"},
+                    headers={"Retry-After": "60"},
+                )
+            recent.append(now)
+            api_rate_buckets[source] = recent
+    return await call_next(request)
+
 probe_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 probe_lock = asyncio.Lock()
 monitor_cycle_lock = asyncio.Lock()
@@ -2042,6 +2075,7 @@ asset_scan_lock = asyncio.Lock()
 security_scan_lock = asyncio.Lock()
 central_log_collection_lock = asyncio.Lock()
 maintenance_execution_tasks: dict[str, asyncio.Task[Any]] = {}
+ssh_semaphore = asyncio.Semaphore(SSH_MAX_CONCURRENCY)
 ubuntu_security_notice_cache: dict[str, tuple[float, dict[str, list[dict[str, Any]]]]] = {}
 ubuntu_security_notice_lock = threading.Lock()
 
@@ -3123,6 +3157,11 @@ def ssh_command(host: dict[str, Any], remote_command: str) -> list[str]:
 
 
 async def run_ssh(host: dict[str, Any], remote_command: str, timeout: float = 8) -> str:
+    async with ssh_semaphore:
+        return await _run_ssh_unlimited(host, remote_command, timeout)
+
+
+async def _run_ssh_unlimited(host: dict[str, Any], remote_command: str, timeout: float = 8) -> str:
     with connect_db() as database:
         active = database.execute(
             "SELECT private_key_encrypted FROM ssh_key_rotations WHERE status='active' ORDER BY promoted_at DESC LIMIT 1"
@@ -3151,6 +3190,10 @@ async def run_ssh(host: dict[str, Any], remote_command: str, timeout: float = 8)
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.CancelledError:
+        process.kill()
+        await process.wait()
+        raise
     except TimeoutError:
         process.kill()
         await process.wait()
@@ -4085,11 +4128,30 @@ def read_platform_health() -> dict[str, Any]:
             "SELECT node_name, last_seen_at FROM external_watchdogs "
             "ORDER BY last_seen_at DESC LIMIT 1"
         ).fetchone()
+        maintenance_worker = connection.execute(
+            "SELECT id,version,active_tasks,last_heartbeat_at FROM maintenance_workers "
+            "ORDER BY last_heartbeat_at DESC LIMIT 1"
+        ).fetchone()
 
     add_check(
         "postgres", "核心服務", "PostgreSQL",
         "healthy", f"{database_row['name']} · PostgreSQL {database_row['version']} · {database_row['username']}",
     )
+
+    if maintenance_worker:
+        worker_age = max(0, int((now - maintenance_worker["last_heartbeat_at"]).total_seconds()))
+        add_check(
+            "maintenance-worker", "核心服務", "維運任務 Worker",
+            "healthy" if worker_age <= 30 else "critical",
+            f"{maintenance_worker['id']} · v{maintenance_worker['version']} · {maintenance_worker['active_tasks']} 個執行中 · 心跳 {worker_age} 秒前",
+            "執行 docker compose logs --tail=100 maintenance-worker" if worker_age > 30 else "",
+        )
+    else:
+        add_check(
+            "maintenance-worker", "核心服務", "維運任務 Worker", "critical",
+            "尚未收到獨立維運 Worker 心跳",
+            "確認 maintenance-worker 容器已啟動：docker compose up -d maintenance-worker",
+        )
 
     heartbeat_path = BACKUP_STORAGE_PATH / ".worker-heartbeat"
     try:
@@ -4943,6 +5005,169 @@ async def maintenance_sudo_readiness(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/api/tasks/workers")
+async def maintenance_worker_status(request: Request) -> dict[str, Any]:
+    require_permission(request, "tasks.read")
+    with connect_db() as connection:
+        rows = connection.execute(
+            """SELECT id,version,concurrency,active_tasks,last_heartbeat_at,started_at,
+                      last_heartbeat_at > NOW() - INTERVAL '30 seconds' AS online
+               FROM maintenance_workers ORDER BY last_heartbeat_at DESC"""
+        ).fetchall()
+        queue = connection.execute(
+            """SELECT COUNT(*) FILTER(WHERE status='queued') AS queued,
+                      COUNT(*) FILTER(WHERE status='running') AS running
+               FROM maintenance_tasks"""
+        ).fetchone()
+    return {
+        "queue": {"queued": queue["queued"], "running": queue["running"]},
+        "workers": [
+            {
+                "id": row["id"], "version": row["version"],
+                "concurrency": row["concurrency"], "activeTasks": row["active_tasks"],
+                "online": row["online"],
+                "lastHeartbeatAt": row["last_heartbeat_at"].isoformat(),
+                "startedAt": row["started_at"].isoformat(),
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/system/limits")
+async def system_resource_limits(request: Request) -> dict[str, Any]:
+    require_permission(request, "audit.read")
+    return {
+        "apiRateLimitPerMinute": API_RATE_LIMIT_PER_MINUTE,
+        "sshMaxConcurrency": SSH_MAX_CONCURRENCY,
+        "maintenanceWorker": {
+            "configuredBy": "MAINTENANCE_WORKER_CONCURRENCY",
+            "maximumAllowed": 8,
+        },
+        "resultLimits": {"hostMetricSamples": 1000, "taskOutputCharacters": 100000},
+    }
+
+
+RETENTION_DELETE_SQL: dict[str, tuple[str, str]] = {
+    "alert_events": ("alert_events", "status='resolved' AND COALESCE(resolved_at,updated_at) < NOW() - make_interval(days => %s)"),
+    "maintenance_tasks": ("maintenance_tasks", "status IN ('succeeded','failed','rejected','cancelled','timed_out') AND completed_at < NOW() - make_interval(days => %s)"),
+    "host_metrics": ("host_metric_samples", "collected_at < NOW() - make_interval(days => %s)"),
+    "automation_runs": ("automation_runs", "status <> 'running' AND completed_at < NOW() - make_interval(days => %s)"),
+    "login_events": ("auth_login_events", "occurred_at < NOW() - make_interval(days => %s)"),
+    "central_logs": ("central_log_events", "collected_at < NOW() - make_interval(days => %s)"),
+}
+
+
+def retention_snapshot(*, delete: bool = False, requested_by: str | None = None) -> dict[str, int]:
+    results: dict[str, int] = {}
+    verb = "DELETE FROM" if delete else "SELECT COUNT(*) AS count FROM"
+    with connect_db() as connection:
+        policies = connection.execute(
+            "SELECT dataset,retention_days,protected FROM data_retention_policy ORDER BY dataset"
+        ).fetchall()
+        for policy in policies:
+            dataset = policy["dataset"]
+            if policy["protected"]:
+                results[dataset] = 0
+                continue
+            days = policy["retention_days"]
+            if dataset == "inventory_scans":
+                count = 0
+                for table in ("host_asset_scans", "host_patch_scans", "host_security_scans"):
+                    cursor = connection.execute(
+                        f"{verb} {table} WHERE checked_at < NOW() - make_interval(days => %s)", (days,)
+                    )
+                    count += cursor.rowcount if delete else cursor.fetchone()["count"]
+                results[dataset] = count
+                continue
+            table, condition = RETENTION_DELETE_SQL[dataset]
+            cursor = connection.execute(f"{verb} {table} WHERE {condition}", (days,))
+            results[dataset] = cursor.rowcount if delete else cursor.fetchone()["count"]
+    return results
+
+
+def read_retention_policy() -> dict[str, Any]:
+    with connect_db() as connection:
+        policies = connection.execute(
+            "SELECT dataset,retention_days,protected,updated_at FROM data_retention_policy ORDER BY dataset"
+        ).fetchall()
+        runs = connection.execute(
+            "SELECT id,status,preview,result,error,started_at,completed_at FROM data_retention_runs ORDER BY started_at DESC LIMIT 20"
+        ).fetchall()
+    return {
+        "policies": [{
+            "dataset": row["dataset"], "retentionDays": row["retention_days"],
+            "protected": row["protected"], "updatedAt": row["updated_at"].isoformat(),
+        } for row in policies],
+        "runs": [{
+            "id": row["id"], "status": row["status"], "preview": row["preview"],
+            "result": row["result"], "error": row["error"],
+            "startedAt": row["started_at"].isoformat(),
+            "completedAt": row["completed_at"].isoformat() if row["completed_at"] else None,
+        } for row in runs],
+    }
+
+
+def run_retention(preview: bool, requested_by: str | None) -> dict[str, Any]:
+    run_id = f"ret-{uuid.uuid4().hex[:20]}"
+    with connect_db() as connection:
+        connection.execute(
+            "INSERT INTO data_retention_runs(id,status,preview,requested_by) VALUES(%s,'running',%s,%s)",
+            (run_id, preview, requested_by),
+        )
+    try:
+        result = retention_snapshot(delete=not preview, requested_by=requested_by)
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE data_retention_runs SET status='success',result=%s,completed_at=NOW() WHERE id=%s",
+                (json.dumps(result), run_id),
+            )
+        return {"id": run_id, "preview": preview, "result": result}
+    except Exception as error:
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE data_retention_runs SET status='failed',error=%s,completed_at=NOW() WHERE id=%s",
+                (str(error)[:2000], run_id),
+            )
+        raise
+
+
+@app.get("/api/retention")
+async def get_retention_policy(request: Request) -> dict[str, Any]:
+    require_permission(request, "backup.read")
+    return await asyncio.to_thread(read_retention_policy)
+
+
+@app.put("/api/retention")
+async def update_retention_policy(payload: RetentionPolicyUpdate, request: Request) -> dict[str, Any]:
+    actor = require_permission(request, "backup.manage")
+    datasets = [item.dataset for item in payload.policies]
+    if len(datasets) != len(set(datasets)):
+        raise HTTPException(status_code=422, detail="保存政策資料類型不可重複")
+    with connect_db() as connection:
+        for item in payload.policies:
+            connection.execute(
+                "UPDATE data_retention_policy SET retention_days=%s,updated_by=%s,updated_at=NOW() WHERE dataset=%s AND protected=FALSE",
+                (item.retention_days, actor["id"], item.dataset),
+            )
+    await asyncio.to_thread(record_backend_audit, request, "retention.update", "更新資料保存政策", ",".join(datasets))
+    return await asyncio.to_thread(read_retention_policy)
+
+
+@app.post("/api/retention/preview")
+async def preview_retention(request: Request) -> dict[str, Any]:
+    actor = require_permission(request, "backup.manage")
+    return await asyncio.to_thread(run_retention, True, actor["id"])
+
+
+@app.post("/api/retention/run")
+async def execute_retention(request: Request) -> dict[str, Any]:
+    actor = require_permission(request, "backup.manage")
+    result = await asyncio.to_thread(run_retention, False, actor["id"])
+    await asyncio.to_thread(record_backend_audit, request, "retention.run", "執行資料保存清理", result["id"])
+    return result
+
+
 @app.post("/api/tasks", status_code=201)
 async def create_maintenance_task(payload: MaintenanceTaskCreate, request: Request) -> dict[str, Any]:
     actor = require_permission(request, "tasks.request")
@@ -5041,7 +5266,7 @@ async def create_alert_maintenance_task(
         existing = connection.execute(
             """SELECT id FROM maintenance_tasks
                WHERE source_alert_id = %s AND runbook_id = %s
-                 AND status IN ('pending', 'approved', 'running')""",
+                 AND status IN ('pending', 'approved', 'queued', 'running')""",
             (event_id, payload.runbook_id),
         ).fetchone()
         if existing:
@@ -5125,10 +5350,10 @@ async def cancel_maintenance_task(task_id: str, request: Request) -> dict[str, A
         row = connection.execute(
             """UPDATE maintenance_tasks
                SET cancel_requested_at=NOW(),
-                   status=CASE WHEN status IN ('pending','approved') THEN 'cancelled' ELSE status END,
-                   completed_at=CASE WHEN status IN ('pending','approved') THEN NOW() ELSE completed_at END,
-                   error=CASE WHEN status IN ('pending','approved') THEN '由管理者取消' ELSE error END
-               WHERE id=%s AND status IN ('pending','approved','running')
+                   status=CASE WHEN status IN ('pending','approved','queued') THEN 'cancelled' ELSE status END,
+                   completed_at=CASE WHEN status IN ('pending','approved','queued') THEN NOW() ELSE completed_at END,
+                   error=CASE WHEN status IN ('pending','approved','queued') THEN '由管理者取消' ELSE error END
+               WHERE id=%s AND status IN ('pending','approved','queued','running')
                RETURNING status""",
             (task_id,),
         ).fetchone()
@@ -5193,6 +5418,17 @@ async def maintenance_reaper_loop() -> None:
         await asyncio.sleep(15)
 
 
+async def retention_cleanup_loop() -> None:
+    # Delay startup cleanup so migrations and the rest of the service settle first.
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await asyncio.to_thread(run_retention, False, None)
+        except (psycopg.Error, KeyError):
+            pass
+        await asyncio.sleep(24 * 60 * 60)
+
+
 @app.post("/api/tasks/recover-stuck")
 async def recover_stuck_tasks(request: Request) -> dict[str, Any]:
     require_permission(request, "tasks.execute")
@@ -5215,27 +5451,15 @@ async def execute_maintenance_task(
             (task_id,),
         ).fetchone()
         task = None if expired else connection.execute(
-            """
-            SELECT host_id, runbook_id
-            FROM maintenance_tasks
-            WHERE id = %s AND status = 'approved'
-            """,
+            "SELECT host_id,runbook_id FROM maintenance_tasks WHERE id=%s AND status='approved'",
             (task_id,),
         ).fetchone()
     if expired:
-        await asyncio.to_thread(
-            record_backend_audit, request, "tasks.execute", "阻擋已過期的維運任務", task_id, "failure"
-        )
         raise HTTPException(status_code=409, detail="任務核准已過期，請重新建立並核准")
     if not task:
-        raise HTTPException(status_code=409, detail="任務必須先核准，且不能重複執行")
+        raise HTTPException(status_code=409, detail="任務必須先核准，且不能重複排入佇列")
     runbook = SAFE_RUNBOOKS.get(task["runbook_id"])
     if not runbook:
-        with connect_db() as connection:
-            connection.execute(
-                "UPDATE maintenance_tasks SET status = 'failed', error = 'Runbook 已不存在', completed_at = NOW() WHERE id = %s",
-                (task_id,),
-            )
         raise HTTPException(status_code=409, detail="Runbook 已不存在")
     if runbook["risk"] == "high" and payload.confirmation != "EXECUTE":
         raise HTTPException(status_code=422, detail="高風險任務必須輸入 EXECUTE 才能執行")
@@ -5243,94 +5467,16 @@ async def execute_maintenance_task(
     if runbook.get("mutating"):
         readiness = await inspect_maintenance_sudo_policy(host)
         if not readiness["ready"]:
-            await asyncio.to_thread(
-                record_backend_audit, request, "tasks.execute", "受控寫入遭安全閘門阻擋",
-                runbook["title"], "failure",
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=f"目標主機未通過維運權限檢查：{readiness['detail']}",
-            )
-    try:
-        with connect_db() as connection:
-            claimed = connection.execute(
-                """
-                UPDATE maintenance_tasks
-                SET status = 'running', started_at = NOW(), heartbeat_at=NOW()
-                WHERE id = %s AND status = 'approved'
-                  AND approval_expires_at > NOW()
-                RETURNING id
-                """,
-                (task_id,),
-            ).fetchone()
-    except psycopg.errors.UniqueViolation as error:
-        raise HTTPException(status_code=409, detail="同一台主機已有維運任務正在執行") from error
-    if not claimed:
-        raise HTTPException(status_code=409, detail="任務已由其他操作執行")
-    started = time.monotonic()
-    evidence: list[str] = []
-    current_execution = asyncio.current_task()
-    if current_execution:
-        maintenance_execution_tasks[task_id] = current_execution
-    try:
-        timeout = float(runbook.get("timeout", 30))
-        if runbook.get("precheck"):
-            precheck = await run_ssh(host, runbook["precheck"], timeout=min(timeout, 60))
-            evidence.append(f"=== 執行前檢查 ===\n{precheck.strip()}")
-            with connect_db() as connection:
-                connection.execute("UPDATE maintenance_tasks SET heartbeat_at=NOW() WHERE id=%s", (task_id,))
-        raw_output = await run_ssh(host, runbook["command"], timeout=timeout)
-        evidence.append(f"=== 執行結果 ===\n{raw_output.strip()}")
-        with connect_db() as connection:
-            connection.execute("UPDATE maintenance_tasks SET heartbeat_at=NOW() WHERE id=%s", (task_id,))
-        if runbook.get("verify_command"):
-            verification = await run_ssh(host, runbook["verify_command"], timeout=min(timeout, 60))
-            evidence.append(f"=== 執行後驗證 ===\n{verification.strip()}")
-        output, _ = redact_diagnostic_text("\n\n".join(evidence))
-        stored_output = output[:30000]
-        duration_ms = max(0, round((time.monotonic() - started) * 1000))
-        output_sha256 = hashlib.sha256(stored_output.encode("utf-8")).hexdigest()
-        with connect_db() as connection:
-            connection.execute(
-                """
-                UPDATE maintenance_tasks
-                SET status = 'succeeded', output = %s, verification_status = 'passed',
-                    output_sha256 = %s, duration_ms = %s, completed_at = NOW()
-                WHERE id = %s
-                """,
-                (stored_output, output_sha256, duration_ms, task_id),
-            )
-        await asyncio.to_thread(record_backend_audit, request, "tasks.execute", "執行安全維運任務", runbook["title"])
-    except asyncio.CancelledError:
-        with connect_db() as connection:
-            connection.execute(
-                """UPDATE maintenance_tasks SET status='cancelled',verification_status='failed',
-                          error='執行中由管理者取消',completed_at=NOW()
-                   WHERE id=%s AND status='running'""", (task_id,)
-            )
-        await asyncio.to_thread(record_backend_audit, request, "tasks.cancel", "中止執行中的維運任務", runbook["title"])
-        raise HTTPException(status_code=409, detail="維運任務已取消") from None
-    except RuntimeError as error:
-        safe_error, _ = redact_diagnostic_text(str(error))
-        partial_output, _ = redact_diagnostic_text("\n\n".join(evidence))
-        stored_partial = partial_output[:30000]
-        partial_sha256 = hashlib.sha256(stored_partial.encode("utf-8")).hexdigest() if stored_partial else None
-        with connect_db() as connection:
-            connection.execute(
-                """
-                UPDATE maintenance_tasks SET status = %s, error = %s, output = %s,
-                    output_sha256 = %s, verification_status = 'failed', duration_ms = %s,
-                    completed_at = NOW()
-                WHERE id = %s
-                """,
-                ("timed_out" if "timed out" in safe_error.lower() else "failed",
-                 safe_error[:1000], stored_partial or None, partial_sha256,
-                 max(0, round((time.monotonic() - started) * 1000)), task_id),
-            )
-        await asyncio.to_thread(record_backend_audit, request, "tasks.execute", "安全維運任務執行失敗", runbook["title"], "failure")
-        raise HTTPException(status_code=504 if "timed out" in safe_error.lower() else 502, detail=safe_error[:500]) from error
-    finally:
-        maintenance_execution_tasks.pop(task_id, None)
+            raise HTTPException(status_code=409, detail=f"目標主機未通過維運權限檢查：{readiness['detail']}")
+    with connect_db() as connection:
+        queued = connection.execute(
+            """UPDATE maintenance_tasks SET status='queued',queued_at=NOW(),heartbeat_at=NULL
+               WHERE id=%s AND status='approved' AND approval_expires_at>NOW() RETURNING id""",
+            (task_id,),
+        ).fetchone()
+    if not queued:
+        raise HTTPException(status_code=409, detail="任務已由其他操作排入佇列")
+    await asyncio.to_thread(record_backend_audit, request, "tasks.queue", "維運任務排入獨立 Worker", runbook["title"])
     return next(item for item in await asyncio.to_thread(read_maintenance_tasks) if item["id"] == task_id)
 
 
