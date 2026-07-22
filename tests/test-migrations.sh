@@ -5,8 +5,19 @@ container="linux-ai-migration-test-$$"
 trap 'docker stop "$container" >/dev/null 2>&1 || true' EXIT
 docker run --rm -d --name "$container" -e POSTGRES_PASSWORD=test -e POSTGRES_DB=linux_ai postgres:18-alpine >/dev/null
 tries=0
-until docker exec "$container" pg_isready -U postgres -d linux_ai >/dev/null 2>&1; do
-  tries=$((tries+1)); test "$tries" -lt 30 || { echo "PostgreSQL 測試容器未就緒"; exit 1; }; sleep 1
+# The official image starts a temporary server during initdb and then restarts
+# PostgreSQL. pg_isready can briefly succeed against that temporary server, so
+# require three consecutive SQL queries before applying migrations.
+stable=0
+while [ "$stable" -lt 3 ]; do
+  if docker exec "$container" psql -U postgres -d linux_ai -Atqc 'SELECT 1' >/dev/null 2>&1; then
+    stable=$((stable+1))
+  else
+    stable=0
+  fi
+  tries=$((tries+1))
+  test "$tries" -lt 60 || { echo "PostgreSQL 測試容器未穩定就緒"; docker logs "$container"; exit 1; }
+  sleep 1
 done
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/sql/001_init.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/002_release_completion.sql >/dev/null
