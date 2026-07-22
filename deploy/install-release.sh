@@ -12,7 +12,7 @@ snapshot_dir="$project_dir/release-snapshots"
 mkdir -p "$snapshot_dir"
 test -w "$snapshot_dir" || { echo "程式回復點目錄不可寫入：$snapshot_dir"; exit 2; }
 snapshot="$snapshot_dir/linux-ai-agent-program-$stamp.tar.gz"
-tar --exclude='./.env' --exclude='./secrets' --exclude='./node_modules' --exclude='./outputs' --exclude='./.git' -czf "$snapshot" -C "$project_dir" .
+tar --exclude='./.env' --exclude='./secrets' --exclude='./node_modules' --exclude='./outputs' --exclude='./release-snapshots' --exclude='./.git' -czf "$snapshot" -C "$project_dir" .
 echo "已建立程式回復點：$snapshot"
 
 if ! tar -tzf "$archive" | grep -q 'compose.yaml'; then

@@ -287,6 +287,7 @@ class AuditChainTests(unittest.TestCase):
         project=Path(__file__).parents[2]; script=(project/"deploy"/"install-release.sh").read_text()
         self.assertIn('snapshot_dir="$project_dir/release-snapshots"',script)
         self.assertNotIn('snapshot="$project_dir/../',script)
+        self.assertIn("--exclude='./release-snapshots'",script)
 
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]

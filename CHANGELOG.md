@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.2 - 2026-07-22
+
+- 排除 `release-snapshots/` 本身，避免建立更新前回復點時把正在產生的壓縮檔再次打包。
+
 ## 1.9.1 - 2026-07-22
 
 - 修正更新前程式回復點誤寫至 `/home` 而發生 Permission denied；現在保存於專案內可寫入的 `release-snapshots/`。
