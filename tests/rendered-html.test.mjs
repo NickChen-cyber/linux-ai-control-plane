@@ -89,6 +89,7 @@ test("ships the Linux AI control plane and removes starter content", async () =>
   assert.match(consoleSource, /\/api\/reliability/);
   assert.match(consoleSource, /營運報表/);
   assert.match(consoleSource, /\/api\/reports/);
+  assert.match(consoleSource, /再次提醒與重大告警升級/);
   assert.match(consoleSource, /立即備份/);
   assert.match(consoleSource, /BACKUP AND RESTORE DRILLS/);
   assert.match(consoleSource, /COLD STANDBY READINESS/);

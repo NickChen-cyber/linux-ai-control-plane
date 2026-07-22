@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.6.1").strip() or "1.6.1"
-MIN_COMPATIBLE_SCHEMA = "008"
+APP_VERSION = os.getenv("APP_VERSION", "1.7.0").strip() or "1.7.0"
+MIN_COMPATIBLE_SCHEMA = "009"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -831,6 +831,10 @@ class NotificationGovernanceUpdate(BaseModel):
 class AlertSilenceCreate(BaseModel):
     name:str=Field(min_length=2,max_length=100); host_id:str|None=Field(default=None,alias="hostId",max_length=100); rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
     starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); reason:str=Field(min_length=2,max_length=500)
+    model_config={"populate_by_name":True}
+
+class NotificationEscalationUpdate(BaseModel):
+    enabled:bool; warning_interval_minutes:int=Field(alias="warningIntervalMinutes",ge=5,le=1440); critical_interval_minutes:int=Field(alias="criticalIntervalMinutes",ge=1,le=1440); max_reminders:int=Field(alias="maxReminders",ge=1,le=20); critical_escalate_after_minutes:int=Field(alias="criticalEscalateAfterMinutes",ge=1,le=10080)
     model_config={"populate_by_name":True}
 
 
@@ -2054,6 +2058,7 @@ async def lifespan(_: FastAPI):
     retention_task = asyncio.create_task(retention_cleanup_loop(), name="data-retention-worker")
     observability_task = asyncio.create_task(observability_loop(), name="service-observability-worker")
     report_task = asyncio.create_task(scheduled_report_loop(), name="scheduled-report-worker")
+    escalation_task = asyncio.create_task(notification_escalation_loop(), name="notification-escalation-worker")
     try:
         yield
     finally:
@@ -2068,6 +2073,7 @@ async def lifespan(_: FastAPI):
         retention_task.cancel()
         observability_task.cancel()
         report_task.cancel()
+        escalation_task.cancel()
         try:
             await asyncio.gather(
                 monitor_task, backup_notification_task, notification_retry_task, central_log_task,
@@ -2078,6 +2084,7 @@ async def lifespan(_: FastAPI):
                 retention_task,
                 observability_task,
                 report_task,
+                escalation_task,
             )
         except asyncio.CancelledError:
             pass
@@ -4042,6 +4049,37 @@ async def monitor_loop() -> None:
             pass
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
+def claim_escalation_reminders()->list[dict[str,Any]]:
+    claimed=[]
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM notification_escalation_policy WHERE id=1").fetchone()
+        if not policy or not policy["enabled"]: return []
+        rows=connection.execute("""SELECT e.id,e.severity,e.message,e.started_at,COUNT(n.id) AS reminders,MAX(n.attempted_at) AS last_attempt
+          FROM alert_events e LEFT JOIN notification_escalations n ON n.alert_event_id=e.id
+          WHERE e.status='firing' GROUP BY e.id HAVING COUNT(n.id)<%s ORDER BY e.started_at LIMIT 50""",(policy["max_reminders"],)).fetchall()
+        now=datetime.now(timezone.utc)
+        for row in rows:
+            interval=policy["critical_interval_minutes"] if row["severity"]=="critical" else policy["warning_interval_minutes"]
+            baseline=row["last_attempt"] or row["started_at"]
+            if (now-baseline).total_seconds()<interval*60: continue
+            number=row["reminders"]+1; escalated=row["severity"]=="critical" and (now-row["started_at"]).total_seconds()>=policy["critical_escalate_after_minutes"]*60
+            rid=f"esc-{uuid.uuid4().hex[:20]}"
+            inserted=connection.execute("INSERT INTO notification_escalations(id,alert_event_id,reminder_number,status,escalated) VALUES(%s,%s,%s,'queued',%s) ON CONFLICT(alert_event_id,reminder_number) DO NOTHING RETURNING id",(rid,row["id"],number,escalated)).fetchone()
+            if inserted: claimed.append({"id":rid,"eventId":row["id"],"severity":row["severity"],"message":row["message"],"number":number,"escalated":escalated})
+    return claimed
+
+async def notification_escalation_loop()->None:
+    while True:
+        try:
+            for item in await asyncio.to_thread(claim_escalation_reminders):
+                prefix="🔥 [重大告警升級]" if item["escalated"] else "⏰ [告警再次提醒]"
+                results=await dispatch_notifications([{"eventId":item["eventId"],"kind":"firing","severity":item["severity"],"message":f"{prefix} 第 {item['number']} 次\n{item['message']}","retryKey":f"escalation:{item['eventId']}:{item['number']}"}])
+                enabled=any(channel["enabled"] for channel in notification_channels())
+                status="sent" if any(r["status"]=="sent" for r in results) else "failed" if results else "suppressed" if enabled else "no_channel"
+                with connect_db() as connection: connection.execute("UPDATE notification_escalations SET status=%s,delivery_count=%s,detail=%s WHERE id=%s",(status,sum(r["status"]=="sent" for r in results),"已交由通知管道" if results else "通知被治理政策抑制或沒有管道",item["id"]))
+        except Exception as error: print(f"notification escalation error: {error}",flush=True)
+        await asyncio.sleep(60)
+
 
 def claim_failed_backup_notifications() -> list[dict[str, Any]]:
     with connect_db() as connection:
@@ -4580,6 +4618,20 @@ async def delete_alert_silence(silence_id:str,request:Request)->Response:
     with connect_db() as connection: row=connection.execute("DELETE FROM alert_silences WHERE id=%s RETURNING name",(silence_id,)).fetchone()
     if not row: raise HTTPException(status_code=404,detail="靜音規則不存在")
     await asyncio.to_thread(record_backend_audit,request,"notifications.silence.delete","刪除告警靜音",row["name"]); return Response(status_code=204)
+
+def read_notification_escalation()->dict[str,Any]:
+    with connect_db() as connection:
+        p=connection.execute("SELECT * FROM notification_escalation_policy WHERE id=1").fetchone(); rows=connection.execute("""SELECT n.*,e.message,e.severity,h.name AS host_name FROM notification_escalations n JOIN alert_events e ON e.id=n.alert_event_id JOIN managed_hosts h ON h.id=e.host_id ORDER BY n.attempted_at DESC LIMIT 100""").fetchall()
+    return {"policy":{"enabled":p["enabled"],"warningIntervalMinutes":p["warning_interval_minutes"],"criticalIntervalMinutes":p["critical_interval_minutes"],"maxReminders":p["max_reminders"],"criticalEscalateAfterMinutes":p["critical_escalate_after_minutes"]},"history":[{"id":r["id"],"alertEventId":r["alert_event_id"],"hostName":r["host_name"],"message":r["message"],"severity":r["severity"],"reminderNumber":r["reminder_number"],"status":r["status"],"escalated":r["escalated"],"deliveryCount":r["delivery_count"],"detail":r["detail"],"attemptedAt":r["attempted_at"].isoformat()} for r in rows]}
+
+@app.get("/api/notifications/escalation")
+async def get_notification_escalation(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_escalation)
+
+@app.put("/api/notifications/escalation")
+async def put_notification_escalation(payload:NotificationEscalationUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE notification_escalation_policy SET enabled=%s,warning_interval_minutes=%s,critical_interval_minutes=%s,max_reminders=%s,critical_escalate_after_minutes=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.enabled,payload.warning_interval_minutes,payload.critical_interval_minutes,payload.max_reminders,payload.critical_escalate_after_minutes,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"notifications.escalation.update","更新通知升級政策",str(payload.enabled)); return await asyncio.to_thread(read_notification_escalation)
 
 
 @app.post("/api/monitoring/collect")

@@ -266,6 +266,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("'email'", migration)
         self.assertNotIn("SMTP_PASSWORD", ui)
 
+    def test_unacknowledged_alert_escalation_is_bounded_and_persisted(self):
+        project = Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"009_notification_escalation.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("notification_escalation_policy",migration); self.assertIn("UNIQUE(alert_event_id,reminder_number)",migration)
+        self.assertIn("notification_escalation_loop",source); self.assertIn("WHERE e.status='firing'",source); self.assertIn('/api/notifications/escalation',source)
+        self.assertIn("再次提醒與重大告警升級",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
