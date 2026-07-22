@@ -217,6 +217,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("Strict-Transport-Security", tls_config)
         self.assertIn("Content-Security-Policy", tls_config)
         self.assertIn("X-Frame-Options", http_config)
+        self.assertIn("resolver 127.0.0.11", tls_config)
+        self.assertIn("server api:8000 resolve", tls_config)
+        self.assertIn("server ui:3000 resolve", tls_config)
+        self.assertIn("resolver 127.0.0.11", http_config)
+        self.assertIn("server api:8000 resolve", http_config)
+        self.assertIn("server ui:3000 resolve", http_config)
 
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
