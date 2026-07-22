@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.4.0.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.5.0.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -39,6 +39,10 @@ sh tests/test-migrations.sh
 ## 1.4.0 升級後驗證
 
 Schema 應為 `006`。登入「營運報表」手動產生一筆報表，確認歷史內容、高頻告警排行與 CSV 下載；自動通知預設停用。
+
+## 1.5.0 升級後驗證
+
+Schema 應為 `007`。設定 SMTP `.env` 後重建 API，在告警中心確認 Email 管道已啟用，再執行測試通知。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \
