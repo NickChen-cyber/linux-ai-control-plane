@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.5.0").strip() or "1.5.0"
-MIN_COMPATIBLE_SCHEMA = "007"
+APP_VERSION = os.getenv("APP_VERSION", "1.6.0").strip() or "1.6.0"
+MIN_COMPATIBLE_SCHEMA = "008"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -820,6 +820,18 @@ class ReportPolicyUpdate(BaseModel):
     notify_enabled: bool = Field(alias="notifyEnabled")
 
     model_config = {"populate_by_name": True}
+
+class NotificationGovernanceUpdate(BaseModel):
+    quiet_enabled: bool = Field(alias="quietEnabled")
+    quiet_start_hour: int = Field(alias="quietStartHour",ge=0,le=23)
+    quiet_end_hour: int = Field(alias="quietEndHour",ge=0,le=23)
+    critical_bypass: bool = Field(alias="criticalBypass")
+    model_config={"populate_by_name":True}
+
+class AlertSilenceCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=100); host_id:str|None=Field(default=None,alias="hostId",max_length=100); rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
+    starts_at:datetime=Field(alias="startsAt"); ends_at:datetime=Field(alias="endsAt"); reason:str=Field(min_length=2,max_length=500)
+    model_config={"populate_by_name":True}
 
 
 class WatchdogHeartbeat(BaseModel):
@@ -3858,6 +3870,20 @@ async def dispatch_notifications(intents: list[dict[str, Any]]) -> list[dict[str
     pairs: list[tuple[str, dict[str, Any]]] = []
     for intent in intents:
         intent.setdefault("retryKey", str(uuid.uuid4()))
+        suppressed=False; reason=""
+        if intent.get("kind") not in {"test"}:
+            with connect_db() as connection:
+                policy=connection.execute("SELECT * FROM notification_governance_policy WHERE id=1").fetchone()
+                silence=None
+                if intent.get("eventId"):
+                    silence=connection.execute("""SELECT s.name FROM alert_silences s JOIN alert_events e ON e.id=%s WHERE s.starts_at<=NOW() AND s.ends_at>NOW() AND (s.host_id IS NULL OR s.host_id=e.host_id) AND (s.rule_id IS NULL OR s.rule_id=e.rule_id) ORDER BY s.created_at DESC LIMIT 1""",(intent["eventId"],)).fetchone()
+                if silence: suppressed=True; reason=f"靜音規則：{silence['name']}"
+                elif policy and policy["quiet_enabled"] and not(intent.get("severity")=="critical" and policy["critical_bypass"]):
+                    hour=datetime.now(timezone.utc).hour; start=policy["quiet_start_hour"]; end=policy["quiet_end_hour"]
+                    if (start<end and start<=hour<end) or (start>end and (hour>=start or hour<end)) or start==end: suppressed=True; reason="全域安靜時段"
+        if suppressed:
+            for channel in enabled: await asyncio.to_thread(write_notification_delivery,channel,intent,"suppressed",next(c["destination"] for c in notification_channels() if c["id"]==channel),reason)
+            continue
         pairs.extend((channel, intent) for channel in enabled)
     results = await asyncio.gather(
         *(asyncio.to_thread(send_notification, channel, intent) for channel, intent in pairs)
@@ -4525,6 +4551,35 @@ def read_monitoring_summary() -> dict[str, Any]:
 async def monitoring_summary(request: Request) -> dict[str, Any]:
     require_permission(request, "alerts.read")
     return await asyncio.to_thread(read_monitoring_summary)
+
+def read_notification_governance()->dict[str,Any]:
+    with connect_db() as connection:
+        p=connection.execute("SELECT * FROM notification_governance_policy WHERE id=1").fetchone(); rows=connection.execute("SELECT id,name,host_id,rule_id,starts_at,ends_at,reason,created_at,ends_at>NOW() AS active FROM alert_silences ORDER BY created_at DESC LIMIT 100").fetchall()
+    return {"policy":{"quietEnabled":p["quiet_enabled"],"quietStartHour":p["quiet_start_hour"],"quietEndHour":p["quiet_end_hour"],"criticalBypass":p["critical_bypass"]},"silences":[{"id":r["id"],"name":r["name"],"hostId":r["host_id"],"ruleId":r["rule_id"],"startsAt":r["starts_at"].isoformat(),"endsAt":r["ends_at"].isoformat(),"reason":r["reason"],"active":r["active"]} for r in rows]}
+
+@app.get("/api/notifications/governance")
+async def get_notification_governance(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_notification_governance)
+
+@app.put("/api/notifications/governance")
+async def put_notification_governance(payload:NotificationGovernanceUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE notification_governance_policy SET quiet_enabled=%s,quiet_start_hour=%s,quiet_end_hour=%s,critical_bypass=%s,updated_by=%s,updated_at=NOW() WHERE id=1",(payload.quiet_enabled,payload.quiet_start_hour,payload.quiet_end_hour,payload.critical_bypass,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"notifications.governance.update","更新通知治理政策",str(payload.quiet_enabled)); return await asyncio.to_thread(read_notification_governance)
+
+@app.post("/api/notifications/silences",status_code=201)
+async def create_alert_silence(payload:AlertSilenceCreate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    if payload.ends_at<=payload.starts_at: raise HTTPException(status_code=422,detail="靜音結束時間必須晚於開始時間")
+    sid=f"sil-{uuid.uuid4().hex[:20]}"
+    with connect_db() as connection: connection.execute("INSERT INTO alert_silences(id,name,host_id,rule_id,starts_at,ends_at,reason,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(sid,payload.name,payload.host_id,payload.rule_id,payload.starts_at,payload.ends_at,payload.reason,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"notifications.silence.create","建立告警靜音",payload.name); return await asyncio.to_thread(read_notification_governance)
+
+@app.delete("/api/notifications/silences/{silence_id}",status_code=204)
+async def delete_alert_silence(silence_id:str,request:Request)->Response:
+    require_permission(request,"alerts.manage")
+    with connect_db() as connection: row=connection.execute("DELETE FROM alert_silences WHERE id=%s RETURNING name",(silence_id,)).fetchone()
+    if not row: raise HTTPException(status_code=404,detail="靜音規則不存在")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.silence.delete","刪除告警靜音",row["name"]); return Response(status_code=204)
 
 
 @app.post("/api/monitoring/collect")

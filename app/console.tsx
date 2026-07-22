@@ -1964,7 +1964,7 @@ type NotificationDelivery = {
   alertEventId?: string | null;
   channel: "telegram" | "line" | "sms" | "webhook" | "email";
   kind: "firing" | "resolved" | "test" | "backup_failed";
-  status: "sent" | "failed";
+  status: "sent" | "failed" | "suppressed";
   destination: string;
   message: string;
   responseDetail?: string | null;
@@ -2384,7 +2384,7 @@ function Alerts({
                   <td><strong>{notificationChannelName(delivery.channel)}</strong></td>
                   <td>{delivery.kind === "firing" ? "告警發生" : delivery.kind === "resolved" ? "告警恢復" : delivery.kind === "backup_failed" ? "備份失敗" : "測試"}</td>
                   <td>{delivery.destination}</td>
-                  <td><span className={`delivery-status ${delivery.status}`}>{delivery.status === "sent" ? "已送出" : "失敗"}</span></td>
+                  <td><span className={`delivery-status ${delivery.status}`}>{delivery.status === "sent" ? "已送出" : delivery.status === "suppressed" ? "已抑制" : "失敗"}</span></td>
                   <td>{delivery.responseDetail || "—"}</td>
                   <td>{new Date(delivery.attemptedAt).toLocaleString("zh-TW", { hour12: false })}</td>
                 </tr>

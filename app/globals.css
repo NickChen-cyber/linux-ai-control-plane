@@ -208,6 +208,7 @@ button.create:hover { filter:brightness(.97); transform:translateY(1px); box-sha
 .delivery-status.failed { color:#a73f38; background:#ffebe8; }
 .notification-help { margin:0; padding:4px 16px 14px; color:#73817b; font-size:8px; }
 .notification-history { border-top:1px solid #e3e8e5; }
+.delivery-status.suppressed { color:#755f20; background:#fff2ce; }
 .notification-retries { border-top:1px solid #e3e8e5; background:#fbfcfb; }
 .retry-status { display:inline-flex; padding:4px 7px; border-radius:4px; font-size:8px; white-space:nowrap; }
 .retry-status.queued,.retry-status.sending { color:#90631a; background:#fff2ce; }

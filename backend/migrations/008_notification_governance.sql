@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS notification_governance_policy(id SMALLINT PRIMARY KEY CHECK(id=1),quiet_enabled BOOLEAN NOT NULL DEFAULT FALSE,quiet_start_hour SMALLINT NOT NULL DEFAULT 22 CHECK(quiet_start_hour BETWEEN 0 AND 23),quiet_end_hour SMALLINT NOT NULL DEFAULT 7 CHECK(quiet_end_hour BETWEEN 0 AND 23),critical_bypass BOOLEAN NOT NULL DEFAULT TRUE,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_by TEXT REFERENCES platform_users(id) ON DELETE SET NULL);
+INSERT INTO notification_governance_policy(id) VALUES(1) ON CONFLICT(id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS alert_silences(id TEXT PRIMARY KEY,name TEXT NOT NULL,host_id TEXT REFERENCES managed_hosts(id) ON DELETE CASCADE,rule_id TEXT REFERENCES alert_rules(id) ON DELETE CASCADE,starts_at TIMESTAMPTZ NOT NULL,ends_at TIMESTAMPTZ NOT NULL,reason TEXT NOT NULL,created_by TEXT REFERENCES platform_users(id) ON DELETE SET NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),CHECK(ends_at>starts_at));
+CREATE INDEX IF NOT EXISTS alert_silences_active_idx ON alert_silences(starts_at,ends_at);
+ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_status_check;
+ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_status_check CHECK(status IN ('sent','failed','suppressed'));
