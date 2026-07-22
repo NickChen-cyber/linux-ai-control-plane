@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 - 2026-07-22
+
+- 新增每週／每月營運報表排程、手動產生與歷史紀錄。
+- 新增告警規則與高頻主機排行、SLO、MTTA／MTTR 與維運任務摘要。
+- 支援 CSV 匯出，以及透過既有 Telegram、LINE、SMS、Webhook 管道發送摘要。
+- 新增 Schema 006 migration、rollback 與整合測試。
+
 ## 1.3.0 - 2026-07-22
 
 - 新增中央服務與受管主機 SLO 可用率報表。

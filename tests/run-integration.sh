@@ -33,6 +33,7 @@ request GET /api/system/limits | python3 -c 'import json,sys; d=json.load(sys.st
 request GET /api/retention | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(p["dataset"]=="audit_events" and p["protected"] for p in d["policies"])'
 request GET /api/observability | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "services" in d and "forecasts" in d and "workers" in d'
 request GET /api/reliability | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "entities" in d and "incidents" in d'
+request GET /api/reports | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "reports" in d and "channels" in d'
 
 if [ "${INTEGRATION_MUTATIONS:-0}" = 1 ]; then
   request POST /api/monitoring/collect | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'

@@ -40,8 +40,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.3.0").strip() or "1.3.0"
-MIN_COMPATIBLE_SCHEMA = "005"
+APP_VERSION = os.getenv("APP_VERSION", "1.4.0").strip() or "1.4.0"
+MIN_COMPATIBLE_SCHEMA = "006"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -799,6 +799,16 @@ class ReliabilityPolicyUpdate(BaseModel):
     availability_target: float = Field(alias="availabilityTarget", ge=90, le=100)
     mtta_target_minutes: int = Field(alias="mttaTargetMinutes", ge=1, le=1440)
     mttr_target_minutes: int = Field(alias="mttrTargetMinutes", ge=1, le=10080)
+
+    model_config = {"populate_by_name": True}
+
+
+class ReportPolicyUpdate(BaseModel):
+    enabled: bool
+    weekly_day: int = Field(alias="weeklyDay", ge=1, le=7)
+    monthly_day: int = Field(alias="monthlyDay", ge=1, le=28)
+    generate_hour_utc: int = Field(alias="generateHourUtc", ge=0, le=23)
+    notify_enabled: bool = Field(alias="notifyEnabled")
 
     model_config = {"populate_by_name": True}
 
@@ -1577,7 +1587,7 @@ def initialize_db() -> None:
                 id TEXT PRIMARY KEY,
                 alert_event_id TEXT REFERENCES alert_events(id) ON DELETE SET NULL,
                 channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook')),
-                kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed')),
+                kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report')),
                 status TEXT NOT NULL CHECK (status IN ('sent', 'failed')),
                 destination_hint TEXT NOT NULL,
                 message TEXT NOT NULL,
@@ -1593,7 +1603,7 @@ def initialize_db() -> None:
             "ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_kind_check"
         )
         connection.execute(
-            "ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind_check CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed'))"
+            "ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind_check CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report'))"
         )
         connection.execute(
             "ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_channel_check"
@@ -1607,7 +1617,7 @@ def initialize_db() -> None:
                 id TEXT PRIMARY KEY,
                 alert_event_id TEXT REFERENCES alert_events(id) ON DELETE SET NULL,
                 channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook')),
-                kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed')),
+                kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report')),
                 severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
                 message TEXT NOT NULL,
                 retry_key TEXT NOT NULL,
@@ -2022,6 +2032,7 @@ async def lifespan(_: FastAPI):
     maintenance_reaper_task = asyncio.create_task(maintenance_reaper_loop(), name="maintenance-task-reaper")
     retention_task = asyncio.create_task(retention_cleanup_loop(), name="data-retention-worker")
     observability_task = asyncio.create_task(observability_loop(), name="service-observability-worker")
+    report_task = asyncio.create_task(scheduled_report_loop(), name="scheduled-report-worker")
     try:
         yield
     finally:
@@ -2035,6 +2046,7 @@ async def lifespan(_: FastAPI):
         maintenance_reaper_task.cancel()
         retention_task.cancel()
         observability_task.cancel()
+        report_task.cancel()
         try:
             await asyncio.gather(
                 monitor_task, backup_notification_task, notification_retry_task, central_log_task,
@@ -2044,6 +2056,7 @@ async def lifespan(_: FastAPI):
                 maintenance_reaper_task,
                 retention_task,
                 observability_task,
+                report_task,
             )
         except asyncio.CancelledError:
             pass
@@ -5302,12 +5315,12 @@ async def observability_summary(request: Request, refresh: bool = False) -> dict
     return await asyncio.to_thread(read_observability)
 
 
-def read_reliability() -> dict[str, Any]:
+def read_reliability(window_days: int | None = None) -> dict[str, Any]:
     with connect_db() as connection:
         policy = connection.execute(
             "SELECT window_days,availability_target,mtta_target_minutes,mttr_target_minutes,updated_at FROM reliability_policy WHERE id=1"
         ).fetchone()
-        days = policy["window_days"]
+        days = window_days or policy["window_days"]
         services = connection.execute(
             """SELECT service,COUNT(*) AS samples,
                       COUNT(*) FILTER(WHERE status='healthy') AS healthy
@@ -5387,6 +5400,121 @@ async def export_reliability(request: Request) -> Response:
         writer.writerow([item["kind"],item["name"],item["samples"],item["availability"],item["target"],"是" if item["met"] else "否"])
     return Response("\ufeff"+output.getvalue(),media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition":f'attachment; filename="linux-ai-reliability-{datetime.now(timezone.utc).date()}.csv"'})
+
+
+def report_snapshot(days: int) -> dict[str, Any]:
+    reliability = read_reliability(days)
+    with connect_db() as connection:
+        by_rule = connection.execute(
+            """SELECT r.name,COUNT(*) AS count,COUNT(*) FILTER(WHERE e.severity='critical') AS critical
+               FROM alert_events e JOIN alert_rules r ON r.id=e.rule_id
+               WHERE e.started_at>=NOW()-make_interval(days=>%s)
+               GROUP BY r.name ORDER BY count DESC,r.name LIMIT 10""", (days,)
+        ).fetchall()
+        by_host = connection.execute(
+            """SELECT h.name,COUNT(*) AS count,COUNT(*) FILTER(WHERE e.severity='critical') AS critical
+               FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id
+               WHERE e.started_at>=NOW()-make_interval(days=>%s)
+               GROUP BY h.name ORDER BY count DESC,h.name LIMIT 10""", (days,)
+        ).fetchall()
+        tasks = connection.execute(
+            """SELECT COUNT(*) AS total,COUNT(*) FILTER(WHERE status='succeeded') AS succeeded,
+                      COUNT(*) FILTER(WHERE status IN ('failed','timed_out')) AS failed
+               FROM maintenance_tasks WHERE requested_at>=NOW()-make_interval(days=>%s)""", (days,)
+        ).fetchone()
+    return {"days":days,"reliability":reliability,"alertsByRule":[dict(row) for row in by_rule],
+        "alertsByHost":[dict(row) for row in by_host],"tasks":dict(tasks),"generatedAt":utc_now()}
+
+
+def create_operational_report(report_type: str, days: int, actor_id: str | None = None) -> dict[str, Any]:
+    end = datetime.now(timezone.utc).date(); start = end-timedelta(days=days)
+    snapshot = report_snapshot(days); report_id = f"rpt-{uuid.uuid4().hex[:20]}"
+    with connect_db() as connection:
+        row = connection.execute(
+            """INSERT INTO operational_reports(id,report_type,period_start,period_end,status,snapshot,requested_by)
+               VALUES(%s,%s,%s,%s,'completed',%s::jsonb,%s)
+               ON CONFLICT(report_type,period_start,period_end) WHERE report_type IN ('weekly','monthly') DO NOTHING
+               RETURNING id""", (report_id,report_type,start,end,json.dumps(snapshot),actor_id)
+        ).fetchone()
+        if not row:
+            existing = connection.execute("SELECT id FROM operational_reports WHERE report_type=%s AND period_start=%s AND period_end=%s",(report_type,start,end)).fetchone()
+            report_id = existing["id"]
+    return next(item for item in read_report_center()["reports"] if item["id"]==report_id)
+
+
+def read_report_center() -> dict[str, Any]:
+    with connect_db() as connection:
+        policy = connection.execute("SELECT * FROM report_policy WHERE id=1").fetchone()
+        rows = connection.execute("""SELECT id,report_type,period_start,period_end,status,snapshot,delivery_status,
+            delivered_channels,error,requested_by,created_at FROM operational_reports ORDER BY created_at DESC LIMIT 100""").fetchall()
+    return {"policy":{"enabled":policy["enabled"],"weeklyDay":policy["weekly_day"],"monthlyDay":policy["monthly_day"],
+        "generateHourUtc":policy["generate_hour_utc"],"notifyEnabled":policy["notify_enabled"],"updatedAt":policy["updated_at"].isoformat()},
+        "channels":notification_channels(),"reports":[{"id":r["id"],"reportType":r["report_type"],
+        "periodStart":r["period_start"].isoformat(),"periodEnd":r["period_end"].isoformat(),"status":r["status"],
+        "snapshot":r["snapshot"],"deliveryStatus":r["delivery_status"],"deliveredChannels":r["delivered_channels"],
+        "error":r["error"],"createdAt":r["created_at"].isoformat()} for r in rows]}
+
+
+async def notify_operational_report(report: dict[str, Any]) -> None:
+    snapshot=report["snapshot"]; incidents=snapshot["reliability"]["incidents"]
+    message=(f"Linux AI {report['reportType']} 營運報表\n期間 {report['periodStart']}～{report['periodEnd']}\n"
+             f"告警 {incidents['total']}（重大 {incidents['critical']}）\nMTTA {incidents['mttaMinutes'] or '—'} 分／MTTR {incidents['mttrMinutes'] or '—'} 分")
+    results=await dispatch_notifications([{"eventId":None,"kind":"report","severity":"warning","message":message,
+        "retryKey":f"report:{report['id']}"}])
+    status="no_channel" if not results else "sent" if any(item["status"]=="sent" for item in results) else "failed"
+    with connect_db() as connection:
+        connection.execute("UPDATE operational_reports SET delivery_status=%s,delivered_channels=%s::jsonb WHERE id=%s",
+            (status,json.dumps([item["channel"] for item in results if item["status"]=="sent"]),report["id"]))
+
+
+@app.get("/api/reports")
+async def reports_center(request: Request) -> dict[str, Any]:
+    require_permission(request,"audit.read"); return await asyncio.to_thread(read_report_center)
+
+
+@app.put("/api/reports/policy")
+async def save_report_policy(payload: ReportPolicyUpdate, request: Request) -> dict[str, Any]:
+    actor=require_permission(request,"backup.manage")
+    with connect_db() as connection:
+        connection.execute("""UPDATE report_policy SET enabled=%s,weekly_day=%s,monthly_day=%s,generate_hour_utc=%s,
+            notify_enabled=%s,updated_by=%s,updated_at=NOW() WHERE id=1""",
+            (payload.enabled,payload.weekly_day,payload.monthly_day,payload.generate_hour_utc,payload.notify_enabled,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"reports.policy.update","更新營運報表排程",str(payload.weekly_day))
+    return await asyncio.to_thread(read_report_center)
+
+
+@app.post("/api/reports",status_code=201)
+async def generate_report(request: Request, notify: bool = False) -> dict[str, Any]:
+    actor=require_permission(request,"backup.manage"); report=await asyncio.to_thread(create_operational_report,"manual",30,actor["id"])
+    if notify: await notify_operational_report(report); report=next(item for item in (await asyncio.to_thread(read_report_center))["reports"] if item["id"]==report["id"])
+    await asyncio.to_thread(record_backend_audit,request,"reports.generate","產生營運報表",report["id"]); return report
+
+
+@app.get("/api/reports/{report_id}/export.csv")
+async def export_report(report_id: str, request: Request) -> Response:
+    require_permission(request,"audit.read"); center=await asyncio.to_thread(read_report_center)
+    report=next((item for item in center["reports"] if item["id"]==report_id),None)
+    if not report: raise HTTPException(status_code=404,detail="報表不存在")
+    output=io.StringIO(); writer=csv.writer(output); writer.writerow(["類型","名稱","告警數","重大告警"])
+    for item in report["snapshot"]["alertsByHost"]: writer.writerow(["主機",item["name"],item["count"],item["critical"]])
+    for item in report["snapshot"]["alertsByRule"]: writer.writerow(["規則",item["name"],item["count"],item["critical"]])
+    return Response("\ufeff"+output.getvalue(),media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":f'attachment; filename="linux-ai-report-{report_id}.csv"'})
+
+
+async def scheduled_report_loop() -> None:
+    while True:
+        try:
+            center=await asyncio.to_thread(read_report_center); policy=center["policy"]; now=datetime.now(timezone.utc)
+            if policy["enabled"] and now.hour==policy["generateHourUtc"]:
+                schedules=[]
+                if now.isoweekday()==policy["weeklyDay"]: schedules.append(("weekly",7))
+                if now.day==policy["monthlyDay"]: schedules.append(("monthly",30))
+                for kind,days in schedules:
+                    report=await asyncio.to_thread(create_operational_report,kind,days,None)
+                    if policy["notifyEnabled"] and report["deliveryStatus"]=="not_requested": await notify_operational_report(report)
+        except Exception as error: print(f"scheduled report error: {error}",flush=True)
+        await asyncio.sleep(900)
 
 
 @app.post("/api/tasks", status_code=201)

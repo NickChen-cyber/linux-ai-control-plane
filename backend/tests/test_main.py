@@ -240,6 +240,21 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("平均確認 MTTA", ui)
         self.assertIn("平均修復 MTTR", ui)
 
+    def test_scheduled_operations_reports_are_persisted_and_audited(self):
+        project = Path(__file__).parents[2]
+        source = (project / "backend" / "app" / "main.py").read_text()
+        migration = (project / "backend" / "migrations" / "006_scheduled_reports.sql").read_text()
+        rollback = (project / "backend" / "migrations" / "down" / "006_scheduled_reports.sql").read_text()
+        ui = (project / "app" / "console.tsx").read_text()
+        self.assertIn("CREATE TABLE IF NOT EXISTS operational_reports", migration)
+        self.assertIn("CREATE TABLE IF NOT EXISTS report_policy", migration)
+        self.assertIn("DROP TABLE IF EXISTS operational_reports", rollback)
+        self.assertIn('/api/reports', source)
+        self.assertIn('/api/reports/policy', source)
+        self.assertIn('scheduled_report_loop', source)
+        self.assertIn('reports.generate', source)
+        self.assertIn("週／月營運報表", ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
