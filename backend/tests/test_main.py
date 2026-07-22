@@ -56,6 +56,16 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("TRUE", migration)
         self.assertIn("資料保存與自動清理", ui)
 
+    def test_monitoring_task_count_is_mapped_to_events_not_rules(self):
+        source = (Path(__file__).parents[1] / "app" / "main.py").read_text()
+        start = source.index("def read_monitoring_summary")
+        end = source.index('@app.get("/api/monitoring")', start)
+        summary = source[start:end]
+        rules_block = summary[summary.index('"rules": ['):summary.index('"events": [')]
+        events_block = summary[summary.index('"events": ['):summary.index('"stats": {')]
+        self.assertNotIn('row["task_count"]', rules_block)
+        self.assertIn('"taskCount": row["task_count"]', events_block)
+
     def test_postgresql_schema_has_required_types_and_indexes(self):
         schema = (Path(__file__).parents[1] / "sql" / "001_init.sql").read_text()
         self.assertIn("TIMESTAMPTZ", schema)

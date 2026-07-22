@@ -4416,7 +4416,6 @@ def read_monitoring_summary() -> dict[str, Any]:
                 "severity": row["severity"], "enabled": row["enabled"],
                 "createdAt": row["created_at"].isoformat(),
                 "updatedAt": row["updated_at"].isoformat(),
-                "taskCount": row["task_count"],
             }
             for row in rules
         ],
@@ -4435,6 +4434,7 @@ def read_monitoring_summary() -> dict[str, Any]:
                 "resolutionSummary": row["resolution_summary"],
                 "resolutionReason": row["resolution_reason"],
                 "closedAt": row["closed_at"].isoformat() if row["closed_at"] else None,
+                "taskCount": row["task_count"],
             }
             for row in events
         ],
