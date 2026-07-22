@@ -283,6 +283,11 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/notification-tests',source); self.assertIn('evaluate_notification_test',source)
         self.assertIn("測試資料不會進入正式告警",ui)
 
+    def test_release_snapshot_is_written_inside_project_directory(self):
+        project=Path(__file__).parents[2]; script=(project/"deploy"/"install-release.sh").read_text()
+        self.assertIn('snapshot_dir="$project_dir/release-snapshots"',script)
+        self.assertNotIn('snapshot="$project_dir/../',script)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

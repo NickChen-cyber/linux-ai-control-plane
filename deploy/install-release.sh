@@ -8,7 +8,10 @@ test -f "$project_dir/compose.yaml" || { echo "不是有效專案目錄：$proje
 
 sh "$project_dir/deploy/check-installation.sh" "$project_dir"
 stamp=$(date +%Y%m%d-%H%M%S)
-snapshot="$project_dir/../linux-ai-agent-program-$stamp.tar.gz"
+snapshot_dir="$project_dir/release-snapshots"
+mkdir -p "$snapshot_dir"
+test -w "$snapshot_dir" || { echo "程式回復點目錄不可寫入：$snapshot_dir"; exit 2; }
+snapshot="$snapshot_dir/linux-ai-agent-program-$stamp.tar.gz"
 tar --exclude='./.env' --exclude='./secrets' --exclude='./node_modules' --exclude='./outputs' --exclude='./.git' -czf "$snapshot" -C "$project_dir" .
 echo "已建立程式回復點：$snapshot"
 
