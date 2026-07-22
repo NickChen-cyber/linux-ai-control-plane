@@ -314,7 +314,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS alert_events_active_idx
 CREATE TABLE IF NOT EXISTS notification_deliveries (
     id TEXT PRIMARY KEY,
     alert_event_id TEXT REFERENCES alert_events(id) ON DELETE SET NULL,
-    channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook')),
+    channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook', 'email')),
     kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report')),
     status TEXT NOT NULL CHECK (status IN ('sent', 'failed')),
     destination_hint TEXT NOT NULL,
@@ -329,7 +329,7 @@ CREATE INDEX IF NOT EXISTS notification_deliveries_time_idx
 CREATE TABLE IF NOT EXISTS notification_retry_jobs (
     id TEXT PRIMARY KEY,
     alert_event_id TEXT REFERENCES alert_events(id) ON DELETE SET NULL,
-    channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook')),
+    channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook', 'email')),
     kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report')),
     severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
     message TEXT NOT NULL,

@@ -1954,7 +1954,7 @@ type MetricSample = {
   failedServices: number;
 };
 type NotificationChannel = {
-  id: "telegram" | "line" | "sms" | "webhook";
+  id: "telegram" | "line" | "sms" | "webhook" | "email";
   name: string;
   enabled: boolean;
   destination: string;
@@ -1962,7 +1962,7 @@ type NotificationChannel = {
 type NotificationDelivery = {
   id: string;
   alertEventId?: string | null;
-  channel: "telegram" | "line" | "sms" | "webhook";
+  channel: "telegram" | "line" | "sms" | "webhook" | "email";
   kind: "firing" | "resolved" | "test" | "backup_failed";
   status: "sent" | "failed";
   destination: string;
@@ -2305,6 +2305,7 @@ function Alerts({
     line: "LINE",
     sms: "SMS Gateway",
     webhook: "Webhook",
+    email: "Email",
   })[channel];
 
   return (

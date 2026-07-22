@@ -255,6 +255,17 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('reports.generate', source)
         self.assertIn("週／月營運報表", ui)
 
+    def test_smtp_email_notifications_keep_credentials_out_of_ui(self):
+        project = Path(__file__).parents[2]
+        source = (project / "backend" / "app" / "main.py").read_text()
+        migration = (project / "backend" / "migrations" / "007_email_notifications.sql").read_text()
+        ui = (project / "app" / "console.tsx").read_text()
+        self.assertIn("SMTP Email", source)
+        self.assertIn("client.starttls()", source)
+        self.assertIn("client.send_message(message)", source)
+        self.assertIn("'email'", migration)
+        self.assertNotIn("SMTP_PASSWORD", ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

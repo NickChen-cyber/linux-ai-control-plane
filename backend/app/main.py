@@ -14,6 +14,7 @@ import secrets
 import shlex
 import shlex
 import subprocess
+import smtplib
 import threading
 import time
 import uuid
@@ -23,6 +24,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.4.0").strip() or "1.4.0"
-MIN_COMPATIBLE_SCHEMA = "006"
+APP_VERSION = os.getenv("APP_VERSION", "1.5.0").strip() or "1.5.0"
+MIN_COMPATIBLE_SCHEMA = "007"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -70,6 +72,13 @@ SMS_GATEWAY_TOKEN = os.getenv("SMS_GATEWAY_TOKEN", "").strip()
 SMS_TO_NUMBER = os.getenv("SMS_TO_NUMBER", "").strip()
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 ALERT_WEBHOOK_TOKEN = os.getenv("ALERT_WEBHOOK_TOKEN", "").strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME).strip()
+SMTP_TO = [item.strip() for item in os.getenv("SMTP_TO", "").split(",") if item.strip()]
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 NOTIFICATION_TIMEOUT_SECONDS = max(
     2, min(int(os.getenv("NOTIFICATION_TIMEOUT_SECONDS", "8")), 30)
 )
@@ -1609,14 +1618,14 @@ def initialize_db() -> None:
             "ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_channel_check"
         )
         connection.execute(
-            "ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_channel_check CHECK (channel IN ('telegram', 'line', 'sms', 'webhook'))"
+            "ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_channel_check CHECK (channel IN ('telegram', 'line', 'sms', 'webhook', 'email'))"
         )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS notification_retry_jobs (
                 id TEXT PRIMARY KEY,
                 alert_event_id TEXT REFERENCES alert_events(id) ON DELETE SET NULL,
-                channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook')),
+                channel TEXT NOT NULL CHECK (channel IN ('telegram', 'line', 'sms', 'webhook', 'email')),
                 kind TEXT NOT NULL CHECK (kind IN ('firing', 'resolved', 'test', 'backup_failed', 'report')),
                 severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
                 message TEXT NOT NULL,
@@ -3639,6 +3648,11 @@ def notification_channels() -> list[dict[str, Any]]:
             "enabled": bool(ALERT_WEBHOOK_URL),
             "destination": webhook_host or "尚未設定",
         },
+        {
+            "id": "email", "name": "SMTP Email",
+            "enabled": bool(SMTP_HOST and SMTP_FROM and SMTP_TO),
+            "destination": f"{len(SMTP_TO)} 位收件者 / {SMTP_HOST}" if SMTP_TO else "尚未設定",
+        },
     ]
 
 
@@ -3668,6 +3682,18 @@ def write_notification_delivery(
 
 def send_notification(channel: str, intent: dict[str, Any]) -> dict[str, Any]:
     headers = {"Content-Type": "application/json", "User-Agent": "linux-ai-control-plane/1"}
+    if channel == "email":
+        destination = f"{len(SMTP_TO)} 位收件者 / {SMTP_HOST}"
+        message = EmailMessage(); message["Subject"] = "Linux AI Control Plane 通知"; message["From"] = SMTP_FROM
+        message["To"] = ", ".join(SMTP_TO); message.set_content(intent["message"])
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=NOTIFICATION_TIMEOUT_SECONDS) as client:
+                if SMTP_USE_TLS: client.starttls()
+                if SMTP_USERNAME: client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.send_message(message)
+            return write_notification_delivery(channel,intent,"sent",destination,"SMTP accepted")
+        except (smtplib.SMTPException,OSError,TimeoutError) as error:
+            return write_notification_delivery(channel,intent,"failed",destination,type(error).__name__)
     if channel == "telegram":
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": intent["message"]}
