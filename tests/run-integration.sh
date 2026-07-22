@@ -46,6 +46,7 @@ request GET /api/alert-correlations | python3 -c 'import json,sys; assert isinst
 request GET /api/alert-storms | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "storms" in d'
 request GET /api/on-call | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "shifts" in d and "assignments" in d'
 request GET /api/alert-ownership | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "events" in d and "workload" in d and "history" in d'
+request GET /api/alert-ownership-sla | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "events" in d'
 host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
 request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 

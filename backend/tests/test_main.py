@@ -353,6 +353,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("SELECT 1 FROM alert_assignments WHERE alert_event_id=%s LIMIT 1",source)
         self.assertIn("告警負責人工作佇列",ui); self.assertIn("解除指派",ui); self.assertIn("異動備註",ui)
 
+    def test_alert_ownership_sla_tracks_deadlines_and_unassigned_events(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"021_alert_ownership_sla.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("alert_ownership_policy",migration); self.assertIn("unassigned_minutes",migration); self.assertIn("due_soon_percent",migration)
+        self.assertIn('/api/alert-ownership-sla',source); self.assertIn('unassigned_overdue',source); self.assertIn('state="overdue"',source)
+        self.assertIn("告警責任時效",ui); self.assertIn("未指派逾時",ui); self.assertIn("即將逾期",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

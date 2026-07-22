@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.8.1").strip() or "2.8.1"
-MIN_COMPATIBLE_SCHEMA = "020"
+APP_VERSION = os.getenv("APP_VERSION", "2.9.0").strip() or "2.9.0"
+MIN_COMPATIBLE_SCHEMA = "021"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -878,6 +878,10 @@ class OnCallShiftCreate(BaseModel):
 
 class AlertOwnershipUpdate(BaseModel):
     user_id:str|None=Field(default=None,alias="userId",max_length=100); note:str=Field(default="",max_length=500)
+    model_config={"populate_by_name":True}
+
+class AlertOwnershipPolicyUpdate(BaseModel):
+    warning_minutes:int=Field(alias="warningMinutes",ge=1,le=10080); critical_minutes:int=Field(alias="criticalMinutes",ge=1,le=10080); unassigned_minutes:int=Field(alias="unassignedMinutes",ge=1,le=1440); due_soon_percent:int=Field(alias="dueSoonPercent",ge=5,le=90)
     model_config={"populate_by_name":True}
 
 
@@ -4937,6 +4941,32 @@ async def update_alert_ownership(event_id:str,payload:AlertOwnershipUpdate,reque
         connection.execute("UPDATE alert_events SET assignee_id=%s,updated_at=NOW() WHERE id=%s",(payload.user_id,event_id))
         connection.execute("INSERT INTO alert_assignments(id,alert_event_id,user_id,previous_user_id,assignment_type,action,note,actor_id) VALUES(%s,%s,%s,%s,'manual',%s,%s,%s)",(f"asn-{uuid.uuid4().hex[:20]}",event_id,payload.user_id,previous,action,payload.note or None,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"alerts.ownership.update","更新告警負責人",event_id); return await asyncio.to_thread(read_alert_ownership)
+
+def read_alert_ownership_sla()->dict[str,Any]:
+    now=datetime.now(timezone.utc)
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM alert_ownership_policy WHERE id=1").fetchone()
+        rows=connection.execute("""SELECT e.id,e.severity,e.started_at,e.acknowledged_at,e.assignee_id,u.display_name AS assignee_name,h.name AS host_name,r.name AS rule_name FROM alert_events e JOIN managed_hosts h ON h.id=e.host_id JOIN alert_rules r ON r.id=e.rule_id LEFT JOIN platform_users u ON u.id=e.assignee_id WHERE e.status IN ('firing','acknowledged') ORDER BY e.started_at""").fetchall()
+    events=[]
+    for row in rows:
+        limit=policy["critical_minutes"] if row["severity"]=="critical" else policy["warning_minutes"]
+        deadline=row["started_at"]+timedelta(minutes=limit); remaining=max(0,int((deadline-now).total_seconds()))
+        unassigned_overdue=not row["assignee_id"] and now>=row["started_at"]+timedelta(minutes=policy["unassigned_minutes"])
+        if row["acknowledged_at"]: state="acknowledged"
+        elif now>=deadline or unassigned_overdue: state="overdue"
+        elif remaining<=limit*60*policy["due_soon_percent"]/100: state="due_soon"
+        else: state="tracking"
+        events.append({"id":row["id"],"hostName":row["host_name"],"ruleName":row["rule_name"],"severity":row["severity"],"assigneeName":row["assignee_name"],"startedAt":row["started_at"].isoformat(),"deadlineAt":deadline.isoformat(),"remainingSeconds":remaining,"state":state,"unassignedOverdue":unassigned_overdue})
+    return {"policy":{"warningMinutes":policy["warning_minutes"],"criticalMinutes":policy["critical_minutes"],"unassignedMinutes":policy["unassigned_minutes"],"dueSoonPercent":policy["due_soon_percent"]},"summary":{"active":len(events),"overdue":sum(e["state"]=="overdue" for e in events),"dueSoon":sum(e["state"]=="due_soon" for e in events),"unassignedOverdue":sum(e["unassignedOverdue"] for e in events)},"events":events}
+
+@app.get("/api/alert-ownership-sla")
+async def get_alert_ownership_sla(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_alert_ownership_sla)
+
+@app.put("/api/alert-ownership-sla/policy")
+async def put_alert_ownership_sla_policy(payload:AlertOwnershipPolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE alert_ownership_policy SET warning_minutes=%s,critical_minutes=%s,unassigned_minutes=%s,due_soon_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.warning_minutes,payload.critical_minutes,payload.unassigned_minutes,payload.due_soon_percent,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"alerts.ownership.sla.update","更新告警責任 SLA",str(payload.model_dump())); return await asyncio.to_thread(read_alert_ownership_sla)
 
 def read_notification_escalation()->dict[str,Any]:
     with connect_db() as connection:
