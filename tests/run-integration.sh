@@ -36,6 +36,8 @@ request GET /api/reliability | python3 -c 'import json,sys; d=json.load(sys.stdi
 request GET /api/reports | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "reports" in d and "channels" in d'
 request GET /api/notifications/governance | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "silences" in d'
 request GET /api/notifications/escalation | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "history" in d'
+host_id=$(request GET /api/hosts | python3 -c 'import json,sys; print(json.load(sys.stdin)["hosts"][0]["id"])')
+request GET "/api/hosts/$host_id/metric-trends?range=7d" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["range"]=="7d" and "samples" in d'
 
 if [ "${INTEGRATION_MUTATIONS:-0}" = 1 ]; then
   request POST /api/monitoring/collect | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'

@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.7.0").strip() or "1.7.0"
-MIN_COMPATIBLE_SCHEMA = "009"
+APP_VERSION = os.getenv("APP_VERSION", "1.8.0").strip() or "1.8.0"
+MIN_COMPATIBLE_SCHEMA = "010"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -2059,6 +2059,7 @@ async def lifespan(_: FastAPI):
     observability_task = asyncio.create_task(observability_loop(), name="service-observability-worker")
     report_task = asyncio.create_task(scheduled_report_loop(), name="scheduled-report-worker")
     escalation_task = asyncio.create_task(notification_escalation_loop(), name="notification-escalation-worker")
+    rollup_task = asyncio.create_task(metric_rollup_loop(), name="metric-rollup-worker")
     try:
         yield
     finally:
@@ -2074,6 +2075,7 @@ async def lifespan(_: FastAPI):
         observability_task.cancel()
         report_task.cancel()
         escalation_task.cancel()
+        rollup_task.cancel()
         try:
             await asyncio.gather(
                 monitor_task, backup_notification_task, notification_retry_task, central_log_task,
@@ -2085,6 +2087,7 @@ async def lifespan(_: FastAPI):
                 observability_task,
                 report_task,
                 escalation_task,
+                rollup_task,
             )
         except asyncio.CancelledError:
             pass
@@ -4049,6 +4052,22 @@ async def monitor_loop() -> None:
             pass
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
+def refresh_metric_rollups()->None:
+    with connect_db() as connection:
+        for table,bucket,window in (("host_metric_hourly","hour","48 hours"),("host_metric_daily","day","120 days")):
+            connection.execute(f"""INSERT INTO {table}(host_id,bucket_at,sample_count,availability_percent,cpu_avg,cpu_max,ram_avg,ram_max,disk_avg,disk_max,failed_service_max)
+              SELECT host_id,date_trunc('{bucket}',collected_at),COUNT(*),100.0*COUNT(*) FILTER(WHERE state<>'offline')/COUNT(*),AVG(cpu_percent),MAX(cpu_percent),AVG(ram_percent),MAX(ram_percent),AVG(disk_percent),MAX(disk_percent),MAX(failed_service_count)
+              FROM host_metric_samples WHERE collected_at>=NOW()-INTERVAL '{window}' GROUP BY host_id,date_trunc('{bucket}',collected_at)
+              ON CONFLICT(host_id,bucket_at) DO UPDATE SET sample_count=EXCLUDED.sample_count,availability_percent=EXCLUDED.availability_percent,cpu_avg=EXCLUDED.cpu_avg,cpu_max=EXCLUDED.cpu_max,ram_avg=EXCLUDED.ram_avg,ram_max=EXCLUDED.ram_max,disk_avg=EXCLUDED.disk_avg,disk_max=EXCLUDED.disk_max,failed_service_max=EXCLUDED.failed_service_max""")
+        connection.execute("DELETE FROM host_metric_hourly WHERE bucket_at<NOW()-INTERVAL '120 days'")
+        connection.execute("DELETE FROM host_metric_daily WHERE bucket_at<NOW()-INTERVAL '400 days'")
+
+async def metric_rollup_loop()->None:
+    while True:
+        try: await asyncio.to_thread(refresh_metric_rollups)
+        except Exception as error: print(f"metric rollup error: {error}",flush=True)
+        await asyncio.sleep(300)
+
 def claim_escalation_reminders()->list[dict[str,Any]]:
     claimed=[]
     with connect_db() as connection:
@@ -6007,6 +6026,16 @@ async def host_metrics(
             for row in rows
         ]
     return {"hostId": host_id, "hours": hours, "samples": await asyncio.to_thread(read_metrics)}
+
+@app.get("/api/hosts/{host_id}/metric-trends")
+async def host_metric_trends(host_id:str,request:Request,range_name:str=Query(default="24h",alias="range",pattern="^(24h|7d|30d|90d)$"))->dict[str,Any]:
+    require_permission(request,"alerts.read"); get_host(host_id)
+    if range_name=="24h": return await host_metrics(host_id,request,24)
+    table="host_metric_hourly" if range_name=="7d" else "host_metric_daily"; days={"7d":7,"30d":30,"90d":90}[range_name]
+    with connect_db() as connection:
+        rows=connection.execute(f"SELECT * FROM {table} WHERE host_id=%s AND bucket_at>=NOW()-make_interval(days=>%s) ORDER BY bucket_at",(host_id,days)).fetchall()
+    samples=[{"collectedAt":r["bucket_at"].isoformat(),"state":"healthy" if float(r["availability_percent"])>=99 else "warning" if float(r["availability_percent"])>=80 else "offline","cpu":float(r["cpu_avg"]),"ram":float(r["ram_avg"]),"disk":float(r["disk_avg"]),"failedServices":r["failed_service_max"],"sampleCount":r["sample_count"],"availability":float(r["availability_percent"])} for r in rows]
+    return {"hostId":host_id,"range":range_name,"resolution":"hour" if table.endswith("hourly") else "day","samples":samples}
 
 
 def ubuntu_security_notice_index(codename: str) -> dict[str, list[dict[str, Any]]]:

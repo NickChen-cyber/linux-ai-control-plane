@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.7.0.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.8.0.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -47,6 +47,10 @@ Schema 應為 `007`。設定 SMTP `.env` 後重建 API，在告警中心確認 E
 ## 1.7.0 升級後驗證
 
 Schema 應為 `009`。告警中心應顯示再次提醒政策與歷史；測試時可暫時將重大提醒間隔設為 1 分鐘。
+
+## 1.8.0 升級後驗證
+
+Schema 應為 `010`。等待約 5 分鐘或重新啟動 API 後，告警中心的 7／30／90 天範圍應可查詢彙總資料。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

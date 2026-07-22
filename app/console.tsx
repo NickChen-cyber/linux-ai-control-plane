@@ -2041,6 +2041,7 @@ function Alerts({
     retentionDays: 30,
   });
   const [selectedHost, setSelectedHost] = useState(hosts[0]?.id ?? "");
+  const [trendRange,setTrendRange]=useState<"24h"|"7d"|"30d"|"90d">("24h");
   const [samples, setSamples] = useState<MetricSample[]>([]);
   const [editingRule, setEditingRule] = useState<AlertRule | "new" | null>(null);
   const [loading, setLoading] = useState(false);
@@ -2081,7 +2082,7 @@ function Alerts({
   const loadMetrics = useCallback(async (hostId: string) => {
     if (!hostId) return setSamples([]);
     const response = await fetch(
-      `/api/hosts/${encodeURIComponent(hostId)}/metrics?hours=24`,
+      `/api/hosts/${encodeURIComponent(hostId)}/metric-trends?range=${trendRange}`,
       { cache: "no-store" },
     );
     const body = (await response.json()) as {
@@ -2090,7 +2091,7 @@ function Alerts({
     };
     if (!response.ok) throw new Error(body.detail || "無法讀取歷史資料");
     setSamples(body.samples ?? []);
-  }, []);
+  }, [trendRange]);
 
   useEffect(() => {
     if (!selectedHost && hosts.length) setSelectedHost(hosts[0].id);
@@ -2109,7 +2110,7 @@ function Alerts({
     void loadMetrics(selectedHost).catch((reason) =>
       setError(reason instanceof Error ? reason.message : "載入失敗"),
     );
-  }, [loadMetrics, selectedHost, stats.samples]);
+  }, [loadMetrics, selectedHost, stats.samples, trendRange]);
 
   const collect = async () => {
     setLoading(true);
@@ -2433,17 +2434,17 @@ function Alerts({
       <div className="card alert-trends">
         <header className="alert-section-head">
           <div>
-            <small>24 HOUR HISTORY</small>
+            <small>{trendRange.toUpperCase()} HISTORY</small>
             <h2>資源趨勢</h2>
           </div>
-          <select
+          <div className="trend-selectors"><select value={trendRange} onChange={event=>setTrendRange(event.target.value as typeof trendRange)}><option value="24h">24 小時</option><option value="7d">7 天</option><option value="30d">30 天</option><option value="90d">90 天</option></select><select
             value={selectedHost}
             onChange={(event) => setSelectedHost(event.target.value)}
           >
             {hosts.map((host) => (
               <option key={host.id} value={host.id}>{host.name} · {host.ip}</option>
             ))}
-          </select>
+          </select></div>
         </header>
         <div className="trend-grid">
           {(["cpu", "ram", "disk"] as const).map((metric) => {

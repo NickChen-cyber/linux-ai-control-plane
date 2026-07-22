@@ -272,6 +272,11 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("notification_escalation_loop",source); self.assertIn("WHERE e.status='firing'",source); self.assertIn('/api/notifications/escalation',source)
         self.assertIn("再次提醒與重大告警升級",ui)
 
+    def test_metric_rollups_support_long_term_indexed_trends(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"010_metric_rollups.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("host_metric_hourly",migration); self.assertIn("host_metric_daily",migration); self.assertIn("host_metric_daily_time_idx",migration)
+        self.assertIn("metric_rollup_loop",source); self.assertIn('/metric-trends',source); self.assertIn('90d',ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
