@@ -295,6 +295,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("resolve_notification_route",source); self.assertIn("ORDER BY priority LIMIT 1",source)
         self.assertIn("告警通知路由",ui); self.assertIn("預設備援路由",ui)
 
+    def test_notification_failure_center_supports_replay_and_resolution(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"013_notification_failure_center.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("notification_retry_actions",migration); self.assertIn("manual_replay_count",migration); self.assertIn("dismissed",migration)
+        self.assertIn('/api/notification-retries/{job_id}/replay',source); self.assertIn('/api/notification-retries/replay-failed',source)
+        self.assertIn("通知失敗處理中心",ui); self.assertIn("忽略結案",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

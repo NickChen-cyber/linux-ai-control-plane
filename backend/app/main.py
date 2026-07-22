@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "2.0.0").strip() or "2.0.0"
-MIN_COMPATIBLE_SCHEMA = "012"
+APP_VERSION = os.getenv("APP_VERSION", "2.1.0").strip() or "2.1.0"
+MIN_COMPATIBLE_SCHEMA = "013"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -850,6 +850,9 @@ class NotificationRouteCreate(BaseModel):
     severity:str|None=Field(default=None,pattern="^(warning|critical)$"); host_id:str|None=Field(default=None,alias="hostId",max_length=100); rule_id:str|None=Field(default=None,alias="ruleId",max_length=100)
     channels:list[str]=Field(min_length=1,max_length=5); title_template:str=Field(alias="titleTemplate",min_length=2,max_length=200); body_template:str=Field(alias="bodyTemplate",min_length=2,max_length=2000)
     model_config={"populate_by_name":True}
+
+class NotificationRetryAction(BaseModel):
+    note:str=Field(default="",max_length=500)
 
 
 class WatchdogHeartbeat(BaseModel):
@@ -4570,12 +4573,14 @@ def read_monitoring_summary() -> dict[str, Any]:
         retries = connection.execute(
             """
             SELECT id, channel, kind, status, attempt_count, max_attempts,
-                   next_attempt_at, last_error, created_at, updated_at
+                   next_attempt_at, last_error, created_at, updated_at,
+                   manual_replay_count,resolved_at,resolution
             FROM notification_retry_jobs
             ORDER BY created_at DESC
             LIMIT 50
             """
         ).fetchall()
+        retry_actions=connection.execute("SELECT a.id,a.retry_job_id,a.action,a.note,a.created_at,u.display_name AS actor_name FROM notification_retry_actions a LEFT JOIN platform_users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT 50").fetchall()
     return {
         "rules": [
             {
@@ -4632,10 +4637,12 @@ def read_monitoring_summary() -> dict[str, Any]:
                 "attemptCount": row["attempt_count"], "maxAttempts": row["max_attempts"],
                 "nextAttemptAt": row["next_attempt_at"].isoformat(),
                 "lastError": row["last_error"], "createdAt": row["created_at"].isoformat(),
-                "updatedAt": row["updated_at"].isoformat(),
+                "updatedAt": row["updated_at"].isoformat(),"manualReplayCount":row["manual_replay_count"],
+                "resolvedAt":row["resolved_at"].isoformat() if row["resolved_at"] else None,"resolution":row["resolution"],
             }
             for row in retries
         ],
+        "retryActions":[{"id":row["id"],"retryJobId":row["retry_job_id"],"action":row["action"],"note":row["note"],"actorName":row["actor_name"],"createdAt":row["created_at"].isoformat()} for row in retry_actions],
     }
 
 
@@ -4643,6 +4650,36 @@ def read_monitoring_summary() -> dict[str, Any]:
 async def monitoring_summary(request: Request) -> dict[str, Any]:
     require_permission(request, "alerts.read")
     return await asyncio.to_thread(read_monitoring_summary)
+
+def act_on_notification_retries(job_ids:list[str],action:str,note:str,actor_id:str)->int:
+    count=0
+    with connect_db() as connection:
+        for job_id in job_ids:
+            if action=="replay":
+                row=connection.execute("UPDATE notification_retry_jobs SET status='queued',attempt_count=0,next_attempt_at=NOW(),manual_replay_count=manual_replay_count+1,resolved_at=NULL,resolved_by=NULL,resolution=NULL,updated_at=NOW() WHERE id=%s AND status IN ('failed','dismissed') RETURNING id",(job_id,)).fetchone()
+            else:
+                row=connection.execute("UPDATE notification_retry_jobs SET status='dismissed',resolved_at=NOW(),resolved_by=%s,resolution=%s,updated_at=NOW() WHERE id=%s AND status='failed' RETURNING id",(actor_id,note or "人工忽略結案",job_id)).fetchone()
+            if row:
+                connection.execute("INSERT INTO notification_retry_actions(id,retry_job_id,action,note,actor_id) VALUES(%s,%s,%s,%s,%s)",(f"nra-{uuid.uuid4().hex[:20]}",job_id,action,note or None,actor_id)); count+=1
+    return count
+
+@app.post("/api/notification-retries/{job_id}/replay")
+async def replay_notification_retry(job_id:str,payload:NotificationRetryAction,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage"); count=await asyncio.to_thread(act_on_notification_retries,[job_id],"replay",payload.note,actor["id"])
+    if not count: raise HTTPException(status_code=409,detail="只有最終失敗或已忽略的通知可以重送")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.retry.replay","人工重送通知",job_id); return {"queued":count}
+
+@app.post("/api/notification-retries/{job_id}/dismiss")
+async def dismiss_notification_retry(job_id:str,payload:NotificationRetryAction,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage"); count=await asyncio.to_thread(act_on_notification_retries,[job_id],"dismiss",payload.note,actor["id"])
+    if not count: raise HTTPException(status_code=409,detail="只有最終失敗通知可以忽略結案")
+    await asyncio.to_thread(record_backend_audit,request,"notifications.retry.dismiss","忽略通知失敗",job_id); return {"dismissed":count}
+
+@app.post("/api/notification-retries/replay-failed")
+async def replay_all_failed_notifications(payload:NotificationRetryAction,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: ids=[row["id"] for row in connection.execute("SELECT id FROM notification_retry_jobs WHERE status='failed' ORDER BY created_at LIMIT 100").fetchall()]
+    count=await asyncio.to_thread(act_on_notification_retries,ids,"replay",payload.note,actor["id"]); await asyncio.to_thread(record_backend_audit,request,"notifications.retry.replay_batch","批次重送失敗通知",str(count)); return {"queued":count}
 
 def read_notification_governance()->dict[str,Any]:
     with connect_db() as connection:

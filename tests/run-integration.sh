@@ -25,6 +25,7 @@ request GET /api/auth/me | python3 -c 'import json,sys; assert json.load(sys.std
 request GET /api/security/posture | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "mfa" in d'
 request GET '/api/hosts?refresh=true' | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["hosts"],list)'
 request GET /api/monitoring | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "events" in d and "rules" in d'
+request GET /api/monitoring | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "retries" in d and "retryActions" in d'
 request GET /api/tasks | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["arbitraryCommandsAllowed"] is False'
 request GET /api/tasks/workers | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "queue" in d and isinstance(d["workers"],list)'
 request GET /api/backups | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "jobs" in d'

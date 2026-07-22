@@ -31,6 +31,7 @@ docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < ba
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/010_metric_rollups.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/011_notification_test_lab.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/012_notification_routing.sql >/dev/null
+docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/013_notification_failure_center.sql >/dev/null
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.maintenance_workers') IS NOT NULL" | grep -qx t
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.capacity_forecasts') IS NOT NULL" | grep -qx t
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.reliability_policy') IS NOT NULL" | grep -qx t
@@ -41,6 +42,8 @@ docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.host_metric_daily') IS NOT NULL" | grep -qx t
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.notification_test_runs') IS NOT NULL" | grep -qx t
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.notification_routes') IS NOT NULL" | grep -qx t
+docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.notification_retry_actions') IS NOT NULL" | grep -qx t
+docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/down/013_notification_failure_center.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/down/012_notification_routing.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/down/011_notification_test_lab.sql >/dev/null
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/down/010_metric_rollups.sql >/dev/null
@@ -55,4 +58,4 @@ docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < ba
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.capacity_forecasts') IS NULL" | grep -qx t
 docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d linux_ai < backend/migrations/down/003_stage2_operations.sql >/dev/null
 docker exec "$container" psql -At -U postgres -d linux_ai -c "SELECT to_regclass('public.maintenance_workers') IS NULL" | grep -qx t
-echo "Migration 001 → 012 與 rollback 測試通過"
+echo "Migration 001 → 013 與 rollback 測試通過"

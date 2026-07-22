@@ -1974,12 +1974,15 @@ type NotificationRetry = {
   id: string;
   channel: NotificationChannel["id"];
   kind: NotificationDelivery["kind"];
-  status: "queued" | "sending" | "sent" | "failed";
+  status: "queued" | "sending" | "sent" | "failed" | "dismissed";
   attemptCount: number;
   maxAttempts: number;
   nextAttemptAt: string;
   lastError?: string | null;
   createdAt: string;
+  manualReplayCount: number;
+  resolvedAt?: string | null;
+  resolution?: string | null;
 };
 
 const alertMetricNames: Record<AlertRule["metric"], string> = {
@@ -2051,6 +2054,7 @@ function Alerts({
   const [channels, setChannels] = useState<NotificationChannel[]>([]);
   const [deliveries, setDeliveries] = useState<NotificationDelivery[]>([]);
   const [retries, setRetries] = useState<NotificationRetry[]>([]);
+  const [retryActions,setRetryActions]=useState<any[]>([]);
   const [stats, setStats] = useState<MonitoringStats>({
     active: 0,
     critical: 0,
@@ -2087,6 +2091,7 @@ function Alerts({
       channels?: NotificationChannel[];
       deliveries?: NotificationDelivery[];
       retries?: NotificationRetry[];
+      retryActions?: any[];
       detail?: string;
     };
     if (!response.ok) throw new Error(body.detail || "無法讀取告警資料");
@@ -2095,6 +2100,7 @@ function Alerts({
     setChannels(body.channels ?? []);
     setDeliveries(body.deliveries ?? []);
     setRetries(body.retries ?? []);
+    setRetryActions(body.retryActions ?? []);
     if (body.stats) setStats(body.stats);
   }, []);
 
@@ -2322,6 +2328,17 @@ function Alerts({
     }
   };
 
+  const retryNotification = async (id?:string) => {
+    setError(""); const path=id?`/api/notification-retries/${id}/replay`:"/api/notification-retries/replay-failed";
+    try { const response=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({note:id?"由告警中心人工重送":"由告警中心批次重送"})}); const body=await response.json(); if(!response.ok)throw new Error(body.detail||"重送失敗"); await loadMonitoring(); }
+    catch(reason){setError(reason instanceof Error?reason.message:"重送失敗")}
+  };
+  const dismissNotification = async (id:string) => {
+    const note=window.prompt("請填寫忽略結案原因","確認目的地已停用或不需補送"); if(note===null)return;
+    try { const response=await fetch(`/api/notification-retries/${id}/dismiss`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({note})}); const body=await response.json(); if(!response.ok)throw new Error(body.detail||"結案失敗"); await loadMonitoring(); }
+    catch(reason){setError(reason instanceof Error?reason.message:"結案失敗")}
+  };
+
   const recentSamples = samples.slice(-60);
   const trend = (metric: "cpu" | "ram" | "disk") => {
     const values = samples.map((sample) => sample[metric]);
@@ -2429,20 +2446,23 @@ function Alerts({
         {deliveries.length === 0 && <div className="empty-state"><strong>尚無通知傳送紀錄</strong></div>}
         {retries.length > 0 && (
           <div className="data-table notification-retries">
+            <div className="retry-heading"><div><strong>通知失敗處理中心</strong><small>自動重試耗盡後可人工重送或忽略結案</small></div>{canManage&&retries.some(item=>item.status==="failed")&&<button className="secondary-action" onClick={()=>void retryNotification()}>批次重送失敗項目</button>}</div>
             <table>
-              <thead><tr><th>重試管道</th><th>狀態</th><th>次數</th><th>錯誤</th><th>下次／更新時間</th></tr></thead>
+              <thead><tr><th>重試管道</th><th>狀態</th><th>自動／人工</th><th>錯誤／結案</th><th>下次／更新時間</th><th>操作</th></tr></thead>
               <tbody>
                 {retries.map((retry) => (
                   <tr key={retry.id}>
                     <td><strong>{notificationChannelName(retry.channel)}</strong></td>
-                    <td><span className={`retry-status ${retry.status}`}>{retry.status === "queued" ? "等待重試" : retry.status === "sending" ? "傳送中" : retry.status === "sent" ? "已補送" : "最終失敗"}</span></td>
-                    <td>{retry.attemptCount} / {retry.maxAttempts}</td>
-                    <td>{retry.lastError || "—"}</td>
+                    <td><span className={`retry-status ${retry.status}`}>{retry.status === "queued" ? "等待重試" : retry.status === "sending" ? "傳送中" : retry.status === "sent" ? "已補送" : retry.status === "dismissed" ? "已忽略結案" : "最終失敗"}</span></td>
+                    <td>{retry.attemptCount} / {retry.maxAttempts} · 人工 {retry.manualReplayCount}</td>
+                    <td>{retry.resolution || retry.lastError || "—"}</td>
                     <td>{new Date(retry.nextAttemptAt).toLocaleString("zh-TW", { hour12: false })}</td>
+                    <td>{canManage&&<div className="access-actions">{(retry.status==="failed"||retry.status==="dismissed")&&<button onClick={()=>void retryNotification(retry.id)}>重送</button>}{retry.status==="failed"&&<button onClick={()=>void dismissNotification(retry.id)}>忽略結案</button>}</div>}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            {retryActions.length>0&&<div className="retry-actions-history">{retryActions.slice(0,10).map(action=><span key={action.id}><strong>{action.action==="replay"?"人工重送":"忽略結案"}</strong><small>{action.actorName||"已刪除使用者"} · {action.note||"無備註"}</small><time>{new Date(action.createdAt).toLocaleString("zh-TW",{hour12:false})}</time></span>)}</div>}
           </div>
         )}
       </div>
