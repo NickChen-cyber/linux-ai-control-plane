@@ -224,6 +224,22 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn("server api:8000 resolve", http_config)
         self.assertIn("server ui:3000 resolve", http_config)
 
+    def test_reliability_slo_reporting_is_versioned_and_exportable(self):
+        project = Path(__file__).parents[2]
+        source = (project / "backend" / "app" / "main.py").read_text()
+        migration = (project / "backend" / "migrations" / "005_reliability_slo.sql").read_text()
+        rollback = (project / "backend" / "migrations" / "down" / "005_reliability_slo.sql").read_text()
+        ui = (project / "app" / "console.tsx").read_text()
+        self.assertIn("CREATE TABLE IF NOT EXISTS reliability_policy", migration)
+        self.assertIn("DROP TABLE IF EXISTS reliability_policy", rollback)
+        self.assertIn('/api/reliability', source)
+        self.assertIn('/api/reliability/policy', source)
+        self.assertIn('/api/reliability/export.csv', source)
+        self.assertIn('require_permission(request, "backup.manage")', source)
+        self.assertIn("可靠性報表", ui)
+        self.assertIn("平均確認 MTTA", ui)
+        self.assertIn("平均修復 MTTR", ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()

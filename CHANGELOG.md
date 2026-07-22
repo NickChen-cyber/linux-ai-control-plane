@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 - 2026-07-22
+
+- 新增中央服務與受管主機 SLO 可用率報表。
+- 新增告警 MTTA／MTTR 指標、可靠性政策與 UTF-8 CSV 匯出。
+- Gateway 改用 Docker 動態 DNS，容器重建後不再持續指向舊 IP。
+- 新增 Schema 005 migration、rollback 與整合測試。
+
 ## 1.2.0 - 2026-07-22
 
 - 新增「容量與服務」頁面，集中顯示 PostgreSQL、備份 Worker 與維運 Worker 健康度。

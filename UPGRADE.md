@@ -5,7 +5,7 @@
 3. 將新版 `.tar.gz` 放到中央主機，執行：
 
 ```bash
-sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.2.0.tar.gz /home/nickc
+sh deploy/install-release.sh /home/nickc/linux-ai-agent-v1.3.0.tar.gz /home/nickc
 ```
 
 腳本會執行環境檢查、保存目前程式快照、重建容器、套用 checksum migration，並驗證 HTTPS/HTTP health。若建置或健康檢查失敗，會自動從快照覆蓋回原版本並重建。
@@ -31,6 +31,10 @@ sh tests/test-migrations.sh
 ## 1.2.0 升級後驗證
 
 更新後等待約 20 秒，再登入「容量與服務」按「立即重新計算」。Schema 應為 `004`，並顯示三個中央服務狀態與受管主機容量資料。
+
+## 1.3.0 升級後驗證
+
+執行 `sh tests/test-migrations.sh` 應通過 Schema `005` 與 rollback；登入「可靠性報表」確認可用率、MTTA、MTTR 與 CSV 匯出可使用。
 
 ```bash
 docker compose -f compose.yaml -f compose.https.yaml exec -T postgres \

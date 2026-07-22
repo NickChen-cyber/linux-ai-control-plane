@@ -40,8 +40,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.2.0").strip() or "1.2.0"
-MIN_COMPATIBLE_SCHEMA = "004"
+APP_VERSION = os.getenv("APP_VERSION", "1.3.0").strip() or "1.3.0"
+MIN_COMPATIBLE_SCHEMA = "005"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -792,6 +792,15 @@ class RetentionPolicyItem(BaseModel):
 
 class RetentionPolicyUpdate(BaseModel):
     policies: list[RetentionPolicyItem] = Field(min_length=1, max_length=7)
+
+
+class ReliabilityPolicyUpdate(BaseModel):
+    window_days: int = Field(alias="windowDays", ge=7, le=90)
+    availability_target: float = Field(alias="availabilityTarget", ge=90, le=100)
+    mtta_target_minutes: int = Field(alias="mttaTargetMinutes", ge=1, le=1440)
+    mttr_target_minutes: int = Field(alias="mttrTargetMinutes", ge=1, le=10080)
+
+    model_config = {"populate_by_name": True}
 
 
 class WatchdogHeartbeat(BaseModel):
@@ -5291,6 +5300,93 @@ async def observability_summary(request: Request, refresh: bool = False) -> dict
     if refresh:
         await asyncio.to_thread(refresh_observability)
     return await asyncio.to_thread(read_observability)
+
+
+def read_reliability() -> dict[str, Any]:
+    with connect_db() as connection:
+        policy = connection.execute(
+            "SELECT window_days,availability_target,mtta_target_minutes,mttr_target_minutes,updated_at FROM reliability_policy WHERE id=1"
+        ).fetchone()
+        days = policy["window_days"]
+        services = connection.execute(
+            """SELECT service,COUNT(*) AS samples,
+                      COUNT(*) FILTER(WHERE status='healthy') AS healthy
+               FROM service_health_samples
+               WHERE collected_at>=NOW()-make_interval(days=>%s)
+               GROUP BY service ORDER BY service""", (days,)
+        ).fetchall()
+        hosts = connection.execute(
+            """SELECT s.host_id,h.name AS host_name,COUNT(*) AS samples,
+                      COUNT(*) FILTER(WHERE s.state<>'offline') AS available
+               FROM host_metric_samples s JOIN managed_hosts h ON h.id=s.host_id
+               WHERE s.collected_at>=NOW()-make_interval(days=>%s)
+               GROUP BY s.host_id,h.name ORDER BY h.name""", (days,)
+        ).fetchall()
+        incidents = connection.execute(
+            """SELECT COUNT(*) AS total,
+                      COUNT(*) FILTER(WHERE severity='critical') AS critical,
+                      COUNT(*) FILTER(WHERE acknowledged_at IS NOT NULL) AS acknowledged,
+                      COUNT(*) FILTER(WHERE resolved_at IS NOT NULL) AS resolved,
+                      AVG(EXTRACT(EPOCH FROM(acknowledged_at-started_at))/60)
+                        FILTER(WHERE acknowledged_at IS NOT NULL) AS mtta,
+                      AVG(EXTRACT(EPOCH FROM(resolved_at-started_at))/60)
+                        FILTER(WHERE resolved_at IS NOT NULL) AS mttr
+               FROM alert_events WHERE started_at>=NOW()-make_interval(days=>%s)""", (days,)
+        ).fetchone()
+        trend = connection.execute(
+            """SELECT date_trunc('day',started_at)::date AS day,COUNT(*) AS incidents,
+                      COUNT(*) FILTER(WHERE severity='critical') AS critical
+               FROM alert_events WHERE started_at>=NOW()-make_interval(days=>%s)
+               GROUP BY 1 ORDER BY 1""", (days,)
+        ).fetchall()
+    target = float(policy["availability_target"])
+    service_rows = [{"name":r["service"],"kind":"service","samples":r["samples"],
+        "availability":round(100*r["healthy"]/r["samples"],3) if r["samples"] else None} for r in services]
+    host_rows = [{"name":r["host_name"],"kind":"host","samples":r["samples"],
+        "availability":round(100*r["available"]/r["samples"],3) if r["samples"] else None} for r in hosts]
+    entities = service_rows+host_rows
+    for item in entities:
+        item["target"] = target
+        item["met"] = item["availability"] is not None and item["availability"] >= target
+    mtta = round(float(incidents["mtta"]),1) if incidents["mtta"] is not None else None
+    mttr = round(float(incidents["mttr"]),1) if incidents["mttr"] is not None else None
+    return {"policy":{"windowDays":days,"availabilityTarget":target,
+        "mttaTargetMinutes":policy["mtta_target_minutes"],"mttrTargetMinutes":policy["mttr_target_minutes"],
+        "updatedAt":policy["updated_at"].isoformat()},"entities":entities,
+        "incidents":{"total":incidents["total"],"critical":incidents["critical"],
+        "acknowledged":incidents["acknowledged"],"resolved":incidents["resolved"],"mttaMinutes":mtta,"mttrMinutes":mttr,
+        "mttaMet":mtta is None or mtta<=policy["mtta_target_minutes"],"mttrMet":mttr is None or mttr<=policy["mttr_target_minutes"]},
+        "trend":[{"day":r["day"].isoformat(),"incidents":r["incidents"],"critical":r["critical"]} for r in trend],
+        "generatedAt":utc_now()}
+
+
+@app.get("/api/reliability")
+async def reliability_summary(request: Request) -> dict[str, Any]:
+    require_permission(request, "audit.read")
+    return await asyncio.to_thread(read_reliability)
+
+
+@app.put("/api/reliability/policy")
+async def update_reliability_policy(payload: ReliabilityPolicyUpdate, request: Request) -> dict[str, Any]:
+    actor = require_permission(request, "backup.manage")
+    with connect_db() as connection:
+        connection.execute("""UPDATE reliability_policy SET window_days=%s,availability_target=%s,
+            mtta_target_minutes=%s,mttr_target_minutes=%s,updated_by=%s,updated_at=NOW() WHERE id=1""",
+            (payload.window_days,payload.availability_target,payload.mtta_target_minutes,payload.mttr_target_minutes,actor["id"]))
+    await asyncio.to_thread(record_backend_audit, request, "reliability.policy.update", "更新可靠性目標", str(payload.window_days))
+    return await asyncio.to_thread(read_reliability)
+
+
+@app.get("/api/reliability/export.csv")
+async def export_reliability(request: Request) -> Response:
+    require_permission(request, "audit.read")
+    report = await asyncio.to_thread(read_reliability)
+    output = io.StringIO(); writer = csv.writer(output)
+    writer.writerow(["類型","名稱","樣本數","可用率","目標","達標"])
+    for item in report["entities"]:
+        writer.writerow([item["kind"],item["name"],item["samples"],item["availability"],item["target"],"是" if item["met"] else "否"])
+    return Response("\ufeff"+output.getvalue(),media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":f'attachment; filename="linux-ai-reliability-{datetime.now(timezone.utc).date()}.csv"'})
 
 
 @app.post("/api/tasks", status_code=201)
