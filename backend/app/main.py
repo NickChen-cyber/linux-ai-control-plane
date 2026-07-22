@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "1.6.0").strip() or "1.6.0"
+APP_VERSION = os.getenv("APP_VERSION", "1.6.1").strip() or "1.6.1"
 MIN_COMPATIBLE_SCHEMA = "008"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))

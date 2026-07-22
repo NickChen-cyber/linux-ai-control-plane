@@ -1995,6 +1995,17 @@ const alertMetricNames: Record<AlertRule["metric"], string> = {
   capacity_forecast: "容量預測天數",
 };
 
+type GovernancePolicy={quietEnabled:boolean;quietStartHour:number;quietEndHour:number;criticalBypass:boolean};
+type AlertSilence={id:string;name:string;hostId?:string|null;ruleId?:string|null;startsAt:string;endsAt:string;reason:string;active:boolean};
+function NotificationGovernance({canManage,hosts,rules}:{canManage:boolean;hosts:HostRow[];rules:AlertRule[]}){
+ const [policy,setPolicy]=useState<GovernancePolicy|null>(null);const [silences,setSilences]=useState<AlertSilence[]>([]);const [error,setError]=useState("");const [open,setOpen]=useState(false);
+ const load=useCallback(async()=>{const response=await fetch("/api/notifications/governance",{cache:"no-store"});const body=await response.json();if(!response.ok)throw new Error(body.detail||"無法讀取通知治理");setPolicy(body.policy);setSilences(body.silences||[])},[]);useEffect(()=>{void load().catch(reason=>setError(reason instanceof Error?reason.message:"載入失敗"))},[load]);
+ const save=async(event:FormEvent<HTMLFormElement>)=>{event.preventDefault();if(!policy)return;const response=await fetch("/api/notifications/governance",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(policy)});const body=await response.json();if(!response.ok){setError(body.detail||"儲存失敗");return}setPolicy(body.policy);setSilences(body.silences||[])};
+ const create=async(event:FormEvent<HTMLFormElement>)=>{event.preventDefault();const data=new FormData(event.currentTarget);const response=await fetch("/api/notifications/silences",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:data.get("name"),hostId:data.get("hostId")||null,ruleId:data.get("ruleId")||null,startsAt:new Date(String(data.get("startsAt"))).toISOString(),endsAt:new Date(String(data.get("endsAt"))).toISOString(),reason:data.get("reason")})});const body=await response.json();if(!response.ok){setError(body.detail||"建立失敗");return}setPolicy(body.policy);setSilences(body.silences||[]);setOpen(false)};
+ const remove=async(id:string)=>{const response=await fetch(`/api/notifications/silences/${id}`,{method:"DELETE"});if(!response.ok){setError("刪除靜音失敗");return}await load()};
+ return <div className="card governance-center"><header className="alert-section-head"><div><small>NOTIFICATION GOVERNANCE</small><h2>安靜時段與告警靜音</h2></div>{canManage&&<button className="create" onClick={()=>setOpen(true)}>＋ 新增靜音</button>}</header>{error&&<div className="log-error">{error}</div>}{policy&&<form className="governance-policy" onSubmit={save}><label className="inline-check"><input type="checkbox" checked={policy.quietEnabled} onChange={e=>setPolicy({...policy,quietEnabled:e.target.checked})}/><span>啟用全域 UTC 安靜時段</span></label><label>開始<input type="number" min="0" max="23" value={policy.quietStartHour} onChange={e=>setPolicy({...policy,quietStartHour:Number(e.target.value)})}/></label><label>結束<input type="number" min="0" max="23" value={policy.quietEndHour} onChange={e=>setPolicy({...policy,quietEndHour:Number(e.target.value)})}/></label><label className="inline-check"><input type="checkbox" checked={policy.criticalBypass} onChange={e=>setPolicy({...policy,criticalBypass:e.target.checked})}/><span>重大告警略過安靜時段</span></label>{canManage&&<button className="secondary-action">儲存政策</button>}</form>}<div className="silence-list">{silences.map(item=><article key={item.id}><div><strong>{item.name}</strong><small>{item.hostId||"全部主機"} · {item.ruleId||"全部規則"} · {item.reason}</small></div><span className={`channel-state ${item.active?"enabled":"disabled"}`}>{item.active?"作用中":"已到期"}</span><time>{new Date(item.endsAt).toLocaleString("zh-TW",{hour12:false})}</time>{canManage&&<button onClick={()=>void remove(item.id)}>刪除</button>}</article>)}</div>{open&&<div className="modal-shell"><form className="modal silence-modal" onSubmit={create}><header><div><small>TIME-BOUND SILENCE</small><h2>新增告警靜音</h2></div><button type="button" onClick={()=>setOpen(false)}>×</button></header><label>名稱<input name="name" required/></label><label>主機<select name="hostId"><option value="">全部主機</option>{hosts.map(h=><option key={h.id} value={h.id}>{h.name}</option>)}</select></label><label>告警規則<select name="ruleId"><option value="">全部規則</option>{rules.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}</select></label><label>開始<input name="startsAt" type="datetime-local" required/></label><label>結束<input name="endsAt" type="datetime-local" required/></label><label>原因<input name="reason" required/></label><footer><button type="button" onClick={()=>setOpen(false)}>取消</button><button className="create">建立靜音</button></footer></form></div>}</div>;
+}
+
 function Alerts({
   hosts,
   canManage,
@@ -2412,6 +2423,8 @@ function Alerts({
           </div>
         )}
       </div>
+
+      <NotificationGovernance canManage={canManage} hosts={hosts} rules={rules} />
 
       <div className="card alert-trends">
         <header className="alert-section-head">
