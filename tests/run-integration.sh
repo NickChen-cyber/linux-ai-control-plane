@@ -48,6 +48,7 @@ request GET /api/on-call | python3 -c 'import json,sys; d=json.load(sys.stdin); 
 request GET /api/on-call-handoffs | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "shifts" in d and "history" in d'
 request GET /api/on-call-templates | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "templates" in d'
 request GET /api/on-call-fairness | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "users" in d'
+request GET /api/on-call-health | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "issues" in d'
 request GET /api/on-call-coverage | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "gaps" in d and "history" in d'
 request GET /api/alert-ownership | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "users" in d and "events" in d and "workload" in d and "history" in d'
 request GET /api/alert-ownership-sla | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "policy" in d and "summary" in d and "events" in d and "history" in d'

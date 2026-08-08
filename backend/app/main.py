@@ -42,8 +42,8 @@ from pydantic import BaseModel, Field
 from app.audit import integrity_hash
 from app.migrations import apply_migrations, migration_status
 
-APP_VERSION = os.getenv("APP_VERSION", "3.5.0").strip() or "3.5.0"
-MIN_COMPATIBLE_SCHEMA = "027"
+APP_VERSION = os.getenv("APP_VERSION", "3.6.0").strip() or "3.6.0"
+MIN_COMPATIBLE_SCHEMA = "028"
 
 INVENTORY_PATH = Path(os.getenv("INVENTORY_PATH", "/app/config/inventory.json"))
 DATABASE_HOST = os.getenv("PGHOST", "postgres")
@@ -890,6 +890,10 @@ class OnCallTemplateCreate(BaseModel):
 
 class OnCallFairnessPolicyUpdate(BaseModel):
     window_days:int=Field(alias="windowDays",ge=1,le=180); imbalance_percent:float=Field(alias="imbalancePercent",ge=1,le=100)
+    model_config={"populate_by_name":True}
+
+class OnCallHealthPolicyUpdate(BaseModel):
+    horizon_days:int=Field(alias="horizonDays",ge=1,le=90); max_shift_hours:float=Field(alias="maxShiftHours",ge=1,le=168); min_rest_hours:float=Field(alias="minRestHours",ge=0,le=72); max_weekly_hours:float=Field(alias="maxWeeklyHours",ge=1,le=168)
     model_config={"populate_by_name":True}
 
 class AlertOwnershipUpdate(BaseModel):
@@ -5095,6 +5099,39 @@ async def put_on_call_fairness_policy(payload:OnCallFairnessPolicyUpdate,request
     actor=require_permission(request,"alerts.manage")
     with connect_db() as connection: connection.execute("UPDATE on_call_fairness_policy SET window_days=%s,imbalance_percent=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.window_days,payload.imbalance_percent,actor["id"]))
     await asyncio.to_thread(record_backend_audit,request,"on_call.fairness.policy.update","更新值班公平性政策",str(payload.model_dump())); return await asyncio.to_thread(read_on_call_fairness)
+
+def read_on_call_health()->dict[str,Any]:
+    now=datetime.now(timezone.utc)
+    with connect_db() as connection:
+        policy=connection.execute("SELECT * FROM on_call_health_policy WHERE id=1").fetchone()
+        rows=connection.execute("""SELECT s.id,s.user_id,s.starts_at,s.ends_at,u.display_name FROM on_call_shifts s JOIN platform_users u ON u.id=s.user_id WHERE s.enabled=TRUE AND u.enabled=TRUE AND s.ends_at>NOW() AND s.starts_at<NOW()+(%s*INTERVAL '1 day') ORDER BY u.display_name,s.starts_at""",(policy["horizon_days"],)).fetchall()
+    by_user:dict[str,list[Any]]={}
+    for row in rows: by_user.setdefault(row["user_id"],[]).append(row)
+    issues=[]; weekly:dict[tuple[str,int,int],float]={}
+    for user_id,shifts in by_user.items():
+        previous=None
+        for shift in shifts:
+            duration=(shift["ends_at"]-shift["starts_at"]).total_seconds()/3600
+            week=shift["starts_at"].isocalendar(); weekly[(user_id,week.year,week.week)]=weekly.get((user_id,week.year,week.week),0)+duration
+            if duration>float(policy["max_shift_hours"]): issues.append({"type":"long_shift","severity":"warning","userName":shift["display_name"],"startsAt":shift["starts_at"].isoformat(),"detail":f"單次值班 {duration:.1f} 小時，超過 {policy['max_shift_hours']} 小時"})
+            if previous:
+                rest=(shift["starts_at"]-previous["ends_at"]).total_seconds()/3600
+                if rest<0: issues.append({"type":"overlap","severity":"critical","userName":shift["display_name"],"startsAt":shift["starts_at"].isoformat(),"detail":f"班次重疊 {abs(rest):.1f} 小時"})
+                elif rest<float(policy["min_rest_hours"]): issues.append({"type":"short_rest","severity":"warning","userName":shift["display_name"],"startsAt":shift["starts_at"].isoformat(),"detail":f"休息僅 {rest:.1f} 小時，低於 {policy['min_rest_hours']} 小時"})
+            previous=shift if previous is None or shift["ends_at"]>previous["ends_at"] else previous
+    names={r["user_id"]:r["display_name"] for r in rows}
+    for (user_id,year,week),hours in weekly.items():
+        if hours>float(policy["max_weekly_hours"]): issues.append({"type":"weekly_hours","severity":"warning","userName":names[user_id],"startsAt":None,"detail":f"{year} 第 {week} 週共 {hours:.1f} 小時，超過 {policy['max_weekly_hours']} 小時"})
+    return {"policy":{"horizonDays":policy["horizon_days"],"maxShiftHours":float(policy["max_shift_hours"]),"minRestHours":float(policy["min_rest_hours"]),"maxWeeklyHours":float(policy["max_weekly_hours"])},"summary":{"shiftCount":len(rows),"issueCount":len(issues),"criticalCount":sum(i["severity"]=="critical" for i in issues),"healthy":not issues},"issues":issues}
+
+@app.get("/api/on-call-health")
+async def get_on_call_health(request:Request)->dict[str,Any]: require_permission(request,"alerts.read"); return await asyncio.to_thread(read_on_call_health)
+
+@app.put("/api/on-call-health/policy")
+async def put_on_call_health_policy(payload:OnCallHealthPolicyUpdate,request:Request)->dict[str,Any]:
+    actor=require_permission(request,"alerts.manage")
+    with connect_db() as connection: connection.execute("UPDATE on_call_health_policy SET horizon_days=%s,max_shift_hours=%s,min_rest_hours=%s,max_weekly_hours=%s,updated_at=NOW(),updated_by=%s WHERE id=1",(payload.horizon_days,payload.max_shift_hours,payload.min_rest_hours,payload.max_weekly_hours,actor["id"]))
+    await asyncio.to_thread(record_backend_audit,request,"on_call.health.policy.update","更新值班健康政策",str(payload.model_dump())); return await asyncio.to_thread(read_on_call_health)
 
 def read_alert_ownership()->dict[str,Any]:
     with connect_db() as connection:

@@ -395,6 +395,12 @@ class AuditChainTests(unittest.TestCase):
         self.assertIn('/api/on-call-fairness',source); self.assertIn("scheduled_hours",source); self.assertIn("sla_breaches",source); self.assertIn("handoffs_in",source)
         self.assertIn("值班負載與公平性",ui); self.assertIn("偏離平均",ui)
 
+    def test_on_call_health_detects_fatigue_and_overlap(self):
+        project=Path(__file__).parents[2]; source=(project/"backend"/"app"/"main.py").read_text(); migration=(project/"backend"/"migrations"/"028_on_call_health.sql").read_text(); ui=(project/"app"/"console.tsx").read_text()
+        self.assertIn("on_call_health_policy",migration); self.assertIn("max_shift_hours",migration); self.assertIn("min_rest_hours",migration); self.assertIn("max_weekly_hours",migration)
+        self.assertIn('/api/on-call-health',source); self.assertIn('"type":"overlap"',source); self.assertIn('"type":"short_rest"',source); self.assertIn('"type":"weekly_hours"',source)
+        self.assertIn("值班健康檢查",ui); self.assertIn("休息不足",ui); self.assertIn("沒有發現值班健康風險",ui)
+
     def test_patch_inventory_is_read_only_and_persisted(self):
         project = Path(__file__).parents[2]
         source = (project / "backend" / "app" / "main.py").read_text()
